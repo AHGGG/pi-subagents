@@ -9,7 +9,7 @@ import { resumeAgent, runAgent } from "../src/agent-runner.js";
 import subagents from "../src/index.js";
 import { ctx, hermeticDir, makePi, textOf } from "./helpers/boot-extension.js";
 
-describe("V1 passive completion wiring", () => {
+describe("automatic completion delivery wiring", () => {
   let env: ReturnType<typeof hermeticDir>;
   let boot: ReturnType<typeof makePi>;
   let context: ReturnType<typeof ctx>;
@@ -52,14 +52,14 @@ describe("V1 passive completion wiring", () => {
   async function consume(id: string) {
     return boot.tools.get("get_subagent_result").execute("get", { agent_id: id, wait: false }, undefined, undefined, context);
   }
-  it("appends an individual completion passively without consuming its result", async () => {
+  it("requests an individual completion turn without consuming its result", async () => {
     await start();
     const id = await spawn();
     await vi.advanceTimersByTimeAsync(400);
     expect(boot.pi.sendMessage).toHaveBeenCalledOnce();
     expect(boot.pi.sendMessage).toHaveBeenCalledWith(expect.objectContaining({
       customType: "subagent-notification", display: true, content: expect.stringContaining(id),
-    }), { triggerTurn: false });
+    }), { deliverAs: "steer", triggerTurn: true });
     expect(manager().getRecord(id).resultConsumed).toBeFalsy();
     expect(textOf(await consume(id))).toContain("CHILD-RESULT");
   });
@@ -82,8 +82,8 @@ describe("V1 passive completion wiring", () => {
     await vi.advanceTimersByTimeAsync(400);
     expect(boot.pi.sendMessage).not.toHaveBeenCalled();
   });
-  it("retains explicit smart grouping and removes consumed members", async () => {
-    await start("smart");
+  it.each(["smart", "group"])("retains explicit %s grouping and removes consumed members", async (joinMode) => {
+    await start(joinMode);
     const first = await spawn("first");
     const second = await spawn("second");
     await vi.advanceTimersByTimeAsync(150);
@@ -91,7 +91,7 @@ describe("V1 passive completion wiring", () => {
     await vi.advanceTimersByTimeAsync(250);
     expect(boot.pi.sendMessage).toHaveBeenCalledOnce();
     const [message, options] = boot.pi.sendMessage.mock.calls[0];
-    expect(options).toEqual({ triggerTurn: false });
+    expect(options).toEqual({ deliverAs: "steer", triggerTurn: true });
     expect(message.content).toContain("1 agent(s) finished");
     expect(message.content).toContain(second);
     expect(message.content).not.toContain(first);
@@ -143,7 +143,7 @@ describe("V1 passive completion wiring", () => {
     await vi.advanceTimersByTimeAsync(400);
     expect(boot.pi.sendMessage).toHaveBeenCalledOnce();
     const [message, options] = boot.pi.sendMessage.mock.calls[0];
-    expect(options).toEqual({ triggerTurn: false });
+    expect(options).toEqual({ deliverAs: "steer", triggerTurn: true });
     expect(message.details.status).toBe("error");
     expect(message.content).toContain("CONTROLLED-CHILD-FAILURE");
     expect(manager().getRecord(id).resultConsumed).toBeFalsy();

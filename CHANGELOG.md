@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.19.0-ahggg.2 — 2026-09-29
+
+- Restore automatic parent continuation on background completion. Use explicit
+  steering delivery at the next model boundary instead of passive-only context.
+- Cover idle wake-up, completion during a final answer, late agent_end delivery,
+  and uninterrupted parallel/sequential tool batches against real Pi 0.87.1.
+- Keep V1 result retention, resumable IDs, async default, shutdown cleanup,
+  execution-identity checks and duplicate/group safeguards.
+- Document that parent-only interruption does not cancel detached children or
+  permanently suppress their later wake-ups; one-shot commands still need joins.
+
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),

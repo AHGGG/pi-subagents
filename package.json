@@ -1,7 +1,7 @@
 {
   "name": "@ahggg/pi-subagents",
-  "version": "0.19.0-ahggg.1",
-  "description": "Personal V1 fork: reliable subagents with passive completion notifications for Pi",
+  "version": "0.19.0-ahggg.2",
+  "description": "Personal fork: reliable subagents with timely completion notices and automatic continuation for Pi",
   "author": "tintinweb",
   "license": "MIT",
   "repository": {

@@ -77,7 +77,7 @@ describe("an agent started by a mention", () => {
         customType: "subagent-notification",
         content: expect.stringContaining("found four planted bugs"),
       }),
-      expect.objectContaining({ triggerTurn: false }),
+      expect.objectContaining({ deliverAs: "steer", triggerTurn: true }),
     );
   });
 
@@ -102,7 +102,7 @@ describe("an agent started by a mention", () => {
         customType: "subagent-notification",
         content: expect.stringContaining("cyan, obviously"),
       }),
-      expect.objectContaining({ triggerTurn: false }),
+      expect.objectContaining({ deliverAs: "steer", triggerTurn: true }),
     );
   });
 });
