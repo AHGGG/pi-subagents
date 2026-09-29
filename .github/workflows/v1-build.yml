@@ -1,0 +1,36 @@
+name: V1 integration build
+
+on:
+  push:
+    branches: [build/v1]
+    paths:
+      - .github/workflows/v1-build.yml
+      - .v1-build/**
+
+permissions:
+  contents: write
+
+jobs:
+  integration:
+    if: github.repository == 'AHGGG/pi-subagents'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build and validate V1, or establish upstream baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f .v1-build/build.mjs ]; then
+            cp -R .v1-build "$RUNNER_TEMP/pi-subagents-v1-build"
+            node "$RUNNER_TEMP/pi-subagents-v1-build/build.mjs"
+          else
+            npm ci
+            npm run check
+            npm run build
+          fi
