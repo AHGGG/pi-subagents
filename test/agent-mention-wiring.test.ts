@@ -266,7 +266,7 @@ describe("messaging a finished agent", () => {
 
     expect(pi.sendMessage).toHaveBeenCalledWith(
       expect.objectContaining({ customType: "subagent-notification", content: expect.stringContaining("second answer") }),
-      expect.objectContaining({ triggerTurn: true }),
+      expect.objectContaining({ triggerTurn: false }),
     );
 
   });

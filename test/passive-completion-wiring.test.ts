@@ -34,7 +34,7 @@ describe("V1 passive completion wiring", () => {
     if (joinMode) {
       const { writeFileSync } = await import("node:fs");
       const { join } = await import("node:path");
-      writeFileSync(join(env.dir, ".pi", "subagents.json"), JSON.stringify({ joinMode, schedulingEnabled: false, rememberAgents: false, outputTranscript: false }));
+      writeFileSync(join(env.dir, ".pi", "subagents.json"), JSON.stringify({ defaultJoinMode: joinMode, schedulingEnabled: false, rememberAgents: false, outputTranscript: false }));
     }
     boot = makePi();
     context = ctx({ isIdle: () => true });
@@ -116,4 +116,37 @@ describe("V1 passive completion wiring", () => {
     await vi.advanceTimersByTimeAsync(400);
     expect(boot.pi.sendMessage).not.toHaveBeenCalled();
   });
+  it("filters a stale grouped execution even after that agent completes again", async () => {
+    await start("smart");
+    const first = await spawn("first-generation");
+    const second = await spawn("sibling");
+    await vi.advanceTimersByTimeAsync(150);
+    // Simulate the same retained agent completing another execution before
+    // the original group hold fires, including the same completion timestamp.
+    const live = manager().getRecord(first);
+    live.promise = Promise.resolve("NEW-GENERATION");
+    live.result = "NEW-GENERATION";
+    live.resultConsumed = false;
+    await vi.advanceTimersByTimeAsync(250);
+    expect(boot.pi.sendMessage).toHaveBeenCalledOnce();
+    const message = boot.pi.sendMessage.mock.calls[0][0];
+    expect(message.content).toContain(second);
+    expect(message.content).toContain("1 agent(s) finished");
+    expect(message.content).not.toContain(first);
+    expect(message.content).not.toContain("NEW-GENERATION");
+  });
+
+  it("reports failure truthfully and does not consume the failed result", async () => {
+    await start();
+    vi.mocked(runAgent).mockRejectedValueOnce(new Error("CONTROLLED-CHILD-FAILURE"));
+    const id = await spawn("failing-child");
+    await vi.advanceTimersByTimeAsync(400);
+    expect(boot.pi.sendMessage).toHaveBeenCalledOnce();
+    const [message, options] = boot.pi.sendMessage.mock.calls[0];
+    expect(options).toEqual({ triggerTurn: false });
+    expect(message.details.status).toBe("error");
+    expect(message.content).toContain("CONTROLLED-CHILD-FAILURE");
+    expect(manager().getRecord(id).resultConsumed).toBeFalsy();
+  });
+
 });

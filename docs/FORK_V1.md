@@ -28,7 +28,7 @@ request. Required joins must use a foreground Agent or get_subagent_result with
 wait: true, particularly in one-shot print/JSON mode. A hung explicit wait remains
 unbounded in V1; this fork does not include the broader timeout/supervisor rewrite.
 
-The default joinMode is async, notifying each finished agent independently.
+The defaultJoinMode setting defaults to async, notifying each finished agent independently.
 Existing explicit smart/group configuration is respected and may delay a group
 notice. Change /agents -> Settings -> Join mode to async for incremental results.
 Workflow-tool completions also append passively; flag-launched workflows retain

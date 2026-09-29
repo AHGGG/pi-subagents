@@ -509,7 +509,13 @@ export default function (pi: ExtensionAPI) {
   // ---- Group join manager ----
   const groupJoin = new GroupJoinManager(
     (records, partial) => {
-      for (const r of records) { agentActivity.delete(r.id); widget.markFinished(r.id); fleet.onAgentFinished(r.id); }
+      for (const r of records) {
+        // A previous grouped run must not erase the resumed run's live activity.
+        if (!isUnreadCompletion(r)) continue;
+        agentActivity.delete(r.id);
+        widget.markFinished(r.id);
+        fleet.onAgentFinished(r.id);
+      }
 
       const groupKey = `group:${records.map(r => r.id).join(",")}`;
       scheduleNudge(groupKey, () => {
@@ -1509,6 +1515,7 @@ Custom agents: .pi/agents/<name>.md (project) or ${getAgentDir()}/agents/<name>.
 Notes:
 - description: 3-5 words (shown in UI). Prompts must be self-contained — the agent has not seen this conversation.
 - Parallel work: one message, multiple Agent calls — they run concurrently.
+- Completion notices are passive: they do not wake an idle parent. Join required results explicitly with get_subagent_result(wait: true) before your final answer.
 - Subagents run in the background by default; you'll be notified when one completes. Pass run_in_background: false only when your very next action depends on the result and nothing else could usefully happen while it runs. Never fabricate or predict a pending agent's results — if the user asks before the notification arrives, say it's still running.
 - The result is not shown to the user — summarize it for them. Verify an agent's claimed code changes before reporting work done.
 - resume continues a previous agent by ID; steer_subagent messages a running one.${isolationCompactGuideline}`;
@@ -2453,7 +2460,7 @@ Background completion notices are passive context: they do not start or force a 
     promptGuidelines: [
       "Use SubagentWorkflow when the number of agents depends on something discovered at runtime, when work flows through stages, or when findings should be independently verified. Use Agent for one delegated task or a handful you can name up front.",
       "Prefer `pipeline` over `parallel` — a barrier costs wall-clock whenever the stages are unevenly sized.",
-      "A workflow runs in the background and notifies you when it finishes — do not poll or sleep waiting for it.",
+      "A workflow runs in the background and appends a passive completion notice. It does not wake an idle parent; do not promise an automatic later response or poll/sleep waiting for it.",
     ],
     parameters: Type.Object({
       script: Type.Optional(
