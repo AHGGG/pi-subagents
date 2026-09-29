@@ -266,7 +266,7 @@ describe("messaging a finished agent", () => {
 
     expect(pi.sendMessage).toHaveBeenCalledWith(
       expect.objectContaining({ customType: "subagent-notification", content: expect.stringContaining("second answer") }),
-      expect.objectContaining({ triggerTurn: true }),
+      expect.objectContaining({ triggerTurn: false }),
     );
 
   });
@@ -1014,6 +1014,7 @@ describe("resuming an evicted agent by name", () => {
   async function evict(id: string) {
     const manager = (globalThis as any)[Symbol.for("pi-subagents:manager")];
     const record = manager.getRecord(id);
+    record.resultConsumed = true;
     record.sessionFile = sessionPath();
     writeFileSync(record.sessionFile, "");
     record.completedAt = Date.now() - 11 * 60_000;

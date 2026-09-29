@@ -17,6 +17,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Worker } from "node:worker_threads";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentManager } from "../src/agent-manager.js";
@@ -952,7 +953,7 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
 
     const sent = booted.pi.sendMessage.mock.calls.find((c: any[]) => String(c[0]?.content).includes(taskId!))!;
     expect(sent[0].customType).toBe("subagent-notification");
-    expect(sent[1]).toMatchObject({ deliverAs: "followUp", triggerTurn: true });
+    expect(sent[1]).toMatchObject({ triggerTurn: false });
     expect(String(sent[0].content)).toContain("<result>done here</result>");
 
     // …and the inline card follows the background run rather than freezing at
@@ -982,6 +983,7 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
   const startedTaskId = (result: unknown) => /Task ID: (\S+)/.exec(textOf(result))![1];
 
   it("kills a still-running workflow (and its worker thread) on session shutdown", async () => {
+    const terminate = vi.spyOn(Worker.prototype, "terminate");
     // A never-returning script: only the run's own abort signal can stop it, so
     // abortAll() over the agent records would leave the worker spinning.
     const result = await tools.get("SubagentWorkflow").execute(
@@ -992,8 +994,11 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
 
     await booted.lifecycle.get("session_shutdown")?.({}, workflowCtx());
 
-    const sent = await awaitNotification(startedTaskId(result));
-    expect(String(sent[0].content)).toContain("<status>Stopped</status>");
+    // Shutdown must terminate the real worker, not try to wake a stale host.
+    await vi.waitFor(() => expect(terminate).toHaveBeenCalledOnce());
+    await Promise.all(terminate.mock.results.filter(r => r.type === "return").map(r => r.value));
+    await new Promise(resolve => setTimeout(resolve, 300));
+    expect(booted.pi.sendMessage.mock.calls.some((c: any[]) => String(c[0]?.content).includes(startedTaskId(result)))).toBe(false);
   });
 
   it("reports a script that threw, rather than a run that quietly ended", async () => {

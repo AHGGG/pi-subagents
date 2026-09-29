@@ -1,3 +1,21 @@
+# AHGGG pi-subagents — personal V1 fork
+
+**Install this fork from Git, not the upstream npm package. Requires Pi >= 0.87.1.**
+
+    pi install git:github.com/AHGGG/pi-subagents
+
+Remove any installed upstream copy first. See [fork installation and behavior](docs/FORK_V1.md).
+
+V1 adds passive completion notices, async join by default, unread result retention,
+resumable foreground IDs, shutdown cleanup and an idle-safe 250ms widget tick.
+Notices reach the next natural model request without interrupting tools or waking
+an idle parent. Tasks that require a child result must still join it explicitly.
+
+The upstream documentation below is retained for reference; the V1 contract above
+supersedes its automatic-wakeup and smart-default descriptions.
+
+---
+
 # @tintinweb/pi-subagents
 
 A [pi](https://pi.dev) extension that brings **Claude Code-style autonomous sub-agents and workflow orchestration** to pi. Spawn specialized agents that run in isolated sessions — each with its own tools, system prompt, model, and thinking level. Run them in the background (the default) or block on them, steer them mid-run, resume completed sessions, and define your own custom agent types. When the orchestration shouldn't be improvised, hand a deterministic JavaScript script to the `SubagentWorkflow` tool — `agent()`, `parallel()`, `pipeline()` — and scripts written for Claude Code's `Workflow` tool run here unchanged.
@@ -413,7 +431,7 @@ Launch a sub-agent.
 | `thinking` | string | no | Thinking level: off, minimal, low, medium, high, xhigh, max (availability depends on pi version and model) |
 | `max_turns` | number | no | Max agentic turns. Omit for unlimited (default) |
 | `run_in_background` | boolean | no | Defaults to `true`; `false` blocks and returns the result inline |
-| `resume` | string | no | Agent ID to resume a previous session |
+| `resume` | string | no | Agent ID to resume a previous session. Read it off the `Agent ID:` line of any spawn or resume result |
 | `isolated` | boolean | no | No extension/MCP tools |
 | `isolation` | `"off"` \| `"worktree"` | no | `worktree` runs in an isolated git worktree; `off` (the default) does not. Absent from the schema entirely when `worktreeIsolation: false` |
 | `inherit_context` | boolean | no | Fork parent conversation into agent |

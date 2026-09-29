@@ -447,6 +447,7 @@ export default function (pi: ExtensionAPI) {
   // ---- Cancellable pending notifications ----
   // Holds notifications briefly so get_subagent_result can cancel them
   // before they reach pi.sendMessage (fire-and-forget).
+  let shuttingDown = false;
   const pendingNudges = new Map<string, ReturnType<typeof setTimeout>>();
   const NUDGE_HOLD_MS = 200;
   // A queued result wait must observe completion before its held notification
@@ -454,6 +455,7 @@ export default function (pi: ExtensionAPI) {
   const QUEUE_WAIT_POLL_MS = Math.floor(NUDGE_HOLD_MS / 4);
 
   function scheduleNudge(key: string, send: () => void, delay = NUDGE_HOLD_MS) {
+    if (shuttingDown) return;
     cancelNudge(key);
     pendingNudges.set(key, setTimeout(() => {
       pendingNudges.delete(key);
@@ -469,38 +471,56 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  // Retained completions are snapshots, not mutable records for resumed runs.
+  // Promise identity distinguishes executions even when timestamps coincide.
+  function isUnreadCompletion(completion: AgentRecord): boolean {
+    if (shuttingDown) return false;
+    const live = manager.getRecord(completion.id);
+    return !!live && !live.resultConsumed
+      && live.status !== "running" && live.status !== "queued"
+      && live.promise === completion.promise
+      && live.completedAt === completion.completedAt;
+  }
+
   // ---- Individual nudge helper (async join mode) ----
   function emitIndividualNudge(record: AgentRecord) {
-    if (record.resultConsumed) return;  // re-check at send time
+    if (!isUnreadCompletion(record)) return; // Re-check consumption and execution.
 
     const notification = formatTaskNotification(record, 500, showCost);
     const footer = record.outputFile ? `\nFull transcript available at: ${record.outputFile}` : '';
 
     pi.sendMessage<NotificationDetails>({
       customType: "subagent-notification",
-      content: notification + footer,
+      content: notification + footer + "\nResult ready. Retrieve full output with get_subagent_result({ agent_id: " + JSON.stringify(record.id) + ", wait: false }). This notice does not mean the result has been consumed.",
       display: true,
       details: buildNotificationDetails(record, 500, agentActivity.get(record.id)),
-    }, { deliverAs: "followUp", triggerTurn: true });
+    }, { triggerTurn: false });
   }
 
   function sendIndividualNudge(record: AgentRecord) {
     agentActivity.delete(record.id);
     widget.markFinished(record.id);
     fleet.onAgentFinished(record.id);
-    scheduleNudge(record.id, () => emitIndividualNudge(record));
+    const completion = { ...record };
+    scheduleNudge(record.id, () => emitIndividualNudge(completion));
     widget.update();
   }
 
   // ---- Group join manager ----
   const groupJoin = new GroupJoinManager(
     (records, partial) => {
-      for (const r of records) { agentActivity.delete(r.id); widget.markFinished(r.id); fleet.onAgentFinished(r.id); }
+      for (const r of records) {
+        // A previous grouped run must not erase the resumed run's live activity.
+        if (!isUnreadCompletion(r)) continue;
+        agentActivity.delete(r.id);
+        widget.markFinished(r.id);
+        fleet.onAgentFinished(r.id);
+      }
 
       const groupKey = `group:${records.map(r => r.id).join(",")}`;
       scheduleNudge(groupKey, () => {
         // Re-check at send time
-        const unconsumed = records.filter(r => !r.resultConsumed);
+        const unconsumed = records.filter(isUnreadCompletion);
         if (unconsumed.length === 0) { widget.update(); return; }
 
         const notifications = unconsumed.map(r => formatTaskNotification(r, 300, showCost)).join('\n\n');
@@ -519,7 +539,7 @@ export default function (pi: ExtensionAPI) {
           content: `Background agent group completed: ${label}\n\n${notifications}\n\nUse get_subagent_result for full output.`,
           display: true,
           details,
-        }, { deliverAs: "followUp", triggerTurn: true });
+        }, { triggerTurn: false });
       });
       widget.update();
     },
@@ -566,6 +586,7 @@ export default function (pi: ExtensionAPI) {
 
   // Background completion: route through group join or send individual nudge
   const manager = new AgentManager((record) => {
+    if (shuttingDown) return;
     // Owned children — nested, or a workflow's — report only through their
     // owner: the parent's scoped tools, or the workflow's card, notification
     // and dialog. Keep them out of top-level lifecycle, transcript,
@@ -1095,6 +1116,7 @@ export default function (pi: ExtensionAPI) {
   // On shutdown, abort all agents immediately and clean up.
   // If the session is going down, there's nothing left to consume agent results.
   pi.on("session_shutdown", async () => {
+    shuttingDown = true;
     rpcHandle?.unsubSpawn();
     rpcHandle?.unsubStop();
     rpcHandle?.unsubPing();
@@ -1114,6 +1136,19 @@ export default function (pi: ExtensionAPI) {
     manager.abortAll();
     for (const timer of pendingNudges.values()) clearTimeout(timer);
     pendingNudges.clear();
+    // Activation-owned timers/UI (#256): the Node process survives reload and
+    // session replacement, so a pending batch debounce, group-join timeout, or
+    // widget render interval from this activation can fire into the next one.
+    // Clear the debounce first — a late finalizeBatch would otherwise schedule
+    // fresh nudges and register stale groups through the paths above — then the
+    // group-join timeouts, then the widget, all before the fleet/manager teardown.
+    if (batchFinalizeTimer) {
+      clearTimeout(batchFinalizeTimer);
+      batchFinalizeTimer = undefined;
+    }
+    currentBatchAgents = [];
+    groupJoin.dispose();
+    widget.dispose();
     fleet.dispose();
     // Awaited: it emits `session_shutdown` into every retained child session so
     // extensions bound there can release what they armed in `session_start` (#242).
@@ -1159,7 +1194,7 @@ export default function (pi: ExtensionAPI) {
   // is silent, this default applies. Read live at spawn time.
 
   // ---- Join mode configuration ----
-  let defaultJoinMode: JoinMode = 'smart';
+  let defaultJoinMode: JoinMode = 'async';
   function getDefaultJoinMode(): JoinMode { return defaultJoinMode; }
   function setDefaultJoinMode(mode: JoinMode) { defaultJoinMode = mode; }
 
@@ -1246,6 +1281,9 @@ export default function (pi: ExtensionAPI) {
       for (const id of ids) {
         const record = manager.getRecord(id);
         if (!record) continue;
+        // Fast runs can settle during awaitStartup, before batch registration.
+        // The group now owns delivery: retract the individual hold first.
+        cancelNudge(id);
         record.groupId = groupId;
         if (record.completedAt != null && !record.resultConsumed) {
           groupJoin.onAgentComplete(record);
@@ -1480,6 +1518,7 @@ Custom agents: .pi/agents/<name>.md (project) or ${getAgentDir()}/agents/<name>.
 Notes:
 - description: 3-5 words (shown in UI). Prompts must be self-contained — the agent has not seen this conversation.
 - Parallel work: one message, multiple Agent calls — they run concurrently.
+- Completion notices are passive: they do not wake an idle parent. Join required results explicitly with get_subagent_result(wait: true) before your final answer.
 - Subagents run in the background by default; you'll be notified when one completes. Pass run_in_background: false only when your very next action depends on the result and nothing else could usefully happen while it runs. Never fabricate or predict a pending agent's results — if the user asks before the notification arrives, say it's still running.
 - The result is not shown to the user — summarize it for them. Verify an agent's claimed code changes before reporting work done.
 - resume continues a previous agent by ID; steer_subagent messages a running one.${isolationCompactGuideline}`;
@@ -1524,6 +1563,9 @@ Brief the agent like a smart colleague who just walked into the room — it hasn
 - Lookups: hand over the exact command. Investigations: hand over the question — prescribed steps become dead weight when the premise is wrong.
 
 Terse command-style prompts produce shallow, generic work.
+
+Background completion notices are passive context: they do not start or force a parent turn. Read a notice on your next natural model request and retrieve relevant results with get_subagent_result. If the final answer depends on a child, explicitly wait for that child with get_subagent_result(wait: true), or use run_in_background: false; do not assume a completion notice will wake an idle or exiting parent.
+
 
 **Never delegate understanding.** Don't write "based on your findings, fix the bug" or "based on the research, implement it." Those phrases push synthesis onto the agent instead of doing it yourself. Write prompts that prove you understood: include file paths, line numbers, what specifically to change.`;
 
@@ -1629,7 +1671,7 @@ Terse command-style prompts produce shallow, generic work.
       ),
       resume: Type.Optional(
         Type.String({
-          description: "Optional agent ID to resume from. Continues from previous context. Resumes detached like any other spawn; pass run_in_background: false to block and get the result inline. An agent can only be resumed once its current run has finished — use steer_subagent to reach one mid-run.",
+          description: "Optional agent ID to resume from, as reported on the `Agent ID:` line of any spawn or resume result. Continues from previous context. Resumes detached like any other spawn; pass run_in_background: false to block and get the result inline. An agent can only be resumed once its current run has finished — use steer_subagent to reach one mid-run.",
         }),
       ),
       isolated: Type.Optional(
@@ -2024,10 +2066,13 @@ Terse command-style prompts produce shallow, generic work.
         // A failed resume surfaces the error, plus any partial output THIS
         // resume produced (never the previous turn's answer, #144).
         if (record.status === "error") {
-          return textResult(`Agent failed: ${record.error}${partialOutputSuffix(record)}`, buildDetails(detailBaseFor(record), record));
+          return textResult(
+            `Agent failed: ${record.error}\nAgent ID: ${record.id}${partialOutputSuffix(record)}`,
+            buildDetails(detailBaseFor(record), record),
+          );
         }
         return textResult(
-          record.result?.trim() || "No output.",
+          `Agent ID: ${record.id}\n\n${record.result?.trim() || "No output."}`,
           buildDetails(detailBaseFor(record), record),
         );
       }
@@ -2250,7 +2295,10 @@ Terse command-style prompts produce shallow, generic work.
 
       if (record.status === "error") {
         // Error headline + any partial output the run produced before failing.
-        return textResult(`${fallbackNote}Agent failed: ${record.error}${partialOutputSuffix(record)}`, details);
+        return textResult(
+          `${fallbackNote}Agent failed: ${record.error}\nAgent ID: ${record.id}${partialOutputSuffix(record)}`,
+          details,
+        );
       }
 
       const durationMs = (record.completedAt ?? Date.now()) - record.startedAt;
@@ -2261,7 +2309,8 @@ Terse command-style prompts produce shallow, generic work.
         if (costText) statsParts.push(costText);
       }
       return textResult(
-        `${fallbackNote}Agent completed in ${formatMs(durationMs)} (${statsParts.join(", ")})${getForegroundOutcomeNote(record.status)}.\n\n` +
+        `${fallbackNote}Agent completed in ${formatMs(durationMs)} (${statsParts.join(", ")})${getForegroundOutcomeNote(record.status)}.\n` +
+        `Agent ID: ${record.id}\n\n` +
         (record.result?.trim() || "No output."),
         details,
       );
@@ -2374,10 +2423,11 @@ Terse command-style prompts produce shallow, generic work.
 
   /**
    * Hand a finished run back to the model through the SAME channel a background
-   * agent uses — held briefly by `scheduleNudge`, delivered as a follow-up that
-   * triggers a turn, rendered by the existing `subagent-notification` renderer.
+   * agent uses — held briefly by `scheduleNudge`, appended as passive context
+   * without starting a turn, rendered by the existing notification renderer.
    */
   function notifyWorkflowFinished(task: WorkflowTask) {
+    if (shuttingDown || !workflowTasks.has(task.id)) return;
     widget.update();
     fleet.update();
     const result = workflowResultText(task);
@@ -2398,7 +2448,7 @@ Terse command-style prompts produce shallow, generic work.
           error: task.error,
           resultPreview: result.length > 500 ? `${result.slice(0, 500)}…` : result,
         },
-      }, { deliverAs: "followUp", triggerTurn: true });
+      }, { triggerTurn: false });
     });
   }
 
@@ -2413,7 +2463,7 @@ Terse command-style prompts produce shallow, generic work.
     promptGuidelines: [
       "Use SubagentWorkflow when the number of agents depends on something discovered at runtime, when work flows through stages, or when findings should be independently verified. Use Agent for one delegated task or a handful you can name up front.",
       "Prefer `pipeline` over `parallel` — a barrier costs wall-clock whenever the stages are unevenly sized.",
-      "A workflow runs in the background and notifies you when it finishes — do not poll or sleep waiting for it.",
+      "A workflow runs in the background and appends a passive completion notice. It does not wake an idle parent; do not promise an automatic later response or poll/sleep waiting for it.",
     ],
     parameters: Type.Object({
       script: Type.Optional(
