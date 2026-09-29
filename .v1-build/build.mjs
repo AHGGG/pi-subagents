@@ -1,7 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-
 const BASE = 'e955e29c51b7a6cce37e1108cd2d6c57a77e151c';
 const UPSTREAM = 'https://github.com/tintinweb/pi-subagents.git';
 const run = (cmd, args) => execFileSync(cmd, args, { stdio: 'inherit' });
@@ -18,22 +17,18 @@ function commit(message) {
   git('add', '-A');
   if (git('diff', '--cached', '--name-only').trim()) run('git', ['commit', '-m', message]);
 }
-
 git('config', 'user.name', 'ChatGPT');
 git('config', 'user.email', 'noreply@openai.com');
 run('git', ['fetch', 'origin', 'master']);
-const branches = git('ls-remote', '--heads', 'origin', 'refs/heads/v1');
-const fresh = !branches.trim();
+const fresh = !git('ls-remote', '--heads', 'origin', 'refs/heads/v1').trim();
 if (fresh) {
-  if (git('rev-parse', 'origin/master').trim() !== BASE) throw new Error('master changed; refusing to build against an unreviewed base');
+  if (git('rev-parse', 'origin/master').trim() !== BASE) throw new Error('master changed; refusing unreviewed base');
   run('git', ['switch', '-c', 'v1', 'origin/master']);
 } else {
   run('git', ['fetch', 'origin', 'v1']);
   run('git', ['switch', '-c', 'v1', 'FETCH_HEAD']);
 }
-
 if (fresh) {
-  // Import only reviewed changes, preserve upstream history, and record exact provenance.
   for (const [number, sha, title, paths] of [
     [311, '8d56733ed2b87b3d93d129e67d14c1bc4469609b', 'expose foreground resumable agent IDs', ['.', ':(exclude)CHANGELOG.md']],
     [316, '75e0db9920c46f29a5dcea8ee9d16f80834c9526', 'dispose activation-owned timers on shutdown', ['.', ':(exclude)CHANGELOG.md']],
@@ -45,13 +40,12 @@ if (fresh) {
     const patch = git('diff', BASE, sha, '--', ...paths);
     execFileSync('git', ['apply', '--index', '-'], { input: patch, stdio: ['pipe', 'inherit', 'inherit'] });
     const author = git('show', '-s', '--format=%an <%ae>', sha).trim();
-    run('git', ['commit', '--author', author, '-m', 'fix: ' + title + ' (upstream #' + number + ')', '-m', 'Ported from ' + UPSTREAM.replace('.git', '') + '/pull/' + number + '\nReviewed head: ' + sha + (number === 321 ? '\nOnly the widget and its tests; unrelated changes deliberately excluded.' : '\nUpstream CHANGELOG omitted; fork notes document these backports.')]);
+    run('git', ['commit', '--author', author, '-m', 'fix: ' + title + ' (upstream #' + number + ')', '-m', 'Ported from https://github.com/tintinweb/pi-subagents/pull/' + number + '\nReviewed head: ' + sha + (number === 321 ? '\nOnly the widget and its tests; unrelated changes excluded.' : '\nUpstream CHANGELOG omitted; fork notes document the backport.')]);
   }
-
   const index = 'src/index.ts';
   replace(index, '  const pendingNudges = new Map<string, ReturnType<typeof setTimeout>>();', '  let shuttingDown = false;\n  const pendingNudges = new Map<string, ReturnType<typeof setTimeout>>();');
   replace(index, '  function scheduleNudge(key: string, send: () => void, delay = NUDGE_HOLD_MS) {\n    cancelNudge(key);', '  function scheduleNudge(key: string, send: () => void, delay = NUDGE_HOLD_MS) {\n    if (shuttingDown) return;\n    cancelNudge(key);');
-  replace(index, '  // ---- Individual nudge helper (async join mode) ----', `  // A retained completion is a snapshot, not the mutable record for a resumed run.
+  replace(index, '  // ---- Individual nudge helper (async join mode) ----', `  // Retained completions are snapshots, not mutable records for resumed runs.
   // Promise identity distinguishes executions even when timestamps coincide.
   function isUnreadCompletion(completion: AgentRecord): boolean {
     if (shuttingDown) return false;
@@ -63,7 +57,7 @@ if (fresh) {
   }
 
   // ---- Individual nudge helper (async join mode) ----`);
-  replace(index, '    if (record.resultConsumed) return;  // re-check at send time', '    if (!isUnreadCompletion(record)) return; // Re-check consumption and execution at send time.');
+  replace(index, '    if (record.resultConsumed) return;  // re-check at send time', '    if (!isUnreadCompletion(record)) return; // Re-check consumption and execution.');
   replace(index, '      content: notification + footer,', '      content: notification + footer + "\\nResult ready. Retrieve full output with get_subagent_result({ agent_id: " + JSON.stringify(record.id) + ", wait: false }). This notice does not mean the result has been consumed.",');
   replace(index, '    scheduleNudge(record.id, () => emitIndividualNudge(record));', '    const completion = { ...record };\n    scheduleNudge(record.id, () => emitIndividualNudge(completion));');
   replace(index, '        const unconsumed = records.filter(r => !r.resultConsumed);', '        const unconsumed = records.filter(isUnreadCompletion);');
@@ -74,15 +68,9 @@ if (fresh) {
   replace(index, '  function notifyWorkflowFinished(task: WorkflowTask) {', '  function notifyWorkflowFinished(task: WorkflowTask) {\n    if (shuttingDown || !workflowTasks.has(task.id)) return;');
   replace(index, '   * agent uses — held briefly by `scheduleNudge`, delivered as a follow-up that\n   * triggers a turn, rendered by the existing `subagent-notification` renderer.', '   * agent uses — held briefly by `scheduleNudge`, appended as passive context\n   * without starting a turn, rendered by the existing notification renderer.');
   replace('src/group-join.ts', '    group.completedRecords.set(record.id, record);', '    // A resume mutates the live record. Keep the execution that actually finished.\n    group.completedRecords.set(record.id, { ...record });');
-
-  // The new default does not force polling or synthetic user input. Required joins
-  // remain explicit, especially for one-shot/headless invocations.
   const passiveNote = '\n\nBackground completion notices are passive context: they do not start or force a parent turn. Read a notice on your next natural model request and retrieve relevant results with get_subagent_result. If the final answer depends on a child, explicitly wait for that child with get_subagent_result(wait: true), or use run_in_background: false; do not assume a completion notice will wake an idle or exiting parent.\n';
   replace(index, 'Terse command-style prompts produce shallow, generic work.', 'Terse command-style prompts produce shallow, generic work.' + passiveNote);
-  if (existsSync('examples/agent-tool-description.md')) {
-    replace('examples/agent-tool-description.md', 'Terse command-style prompts produce shallow, generic work.', 'Terse command-style prompts produce shallow, generic work.' + passiveNote);
-  }
-
+  replace('examples/agent-tool-description.md', 'Terse command-style prompts produce shallow, generic work.', 'Terse command-style prompts produce shallow, generic work.' + passiveNote);
   const pkg = JSON.parse(read('package.json'));
   pkg.name = '@ahggg/pi-subagents';
   pkg.version = '0.19.0-ahggg.1';
@@ -96,50 +84,11 @@ if (fresh) {
     pkg.devDependencies[name] = '0.87.1';
   }
   put('package.json', JSON.stringify(pkg, null, 2) + '\n');
-
-  put('.github/workflows/ci.yml', `name: CI
-on:
-  push:
-    branches: [master, v1]
-  pull_request:
-    branches: [master]
-permissions:
-  contents: read
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - run: npm run check
-      - run: npm run build
-      - run: npm run test:e2e
-  compat-latest-pi:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - name: Install latest Pi canary
-        run: npm install --no-save @earendil-works/pi-ai@latest @earendil-works/pi-coding-agent@latest @earendil-works/pi-tui@latest
-      - run: npm run check
-      - run: npm run build
-`);
-
+  // No workflow files are changed by this source-only runner.
   put('docs/FORK_V1.md', `# AHGGG personal fork — V1
 
 Based on upstream master e955e29c51b7a6cce37e1108cd2d6c57a77e151c.
-Requires Pi 0.87.1 or newer; development and required CI are pinned to 0.87.1.
+Requires Pi 0.87.1 or newer; development dependencies are pinned to 0.87.1.
 This is a Git-installed personal fork, not a published npm package.
 
 ## Install
@@ -152,7 +101,7 @@ Remove the upstream extension first so two copies do not register the same tools
 Then restart Pi (or use /reload after running agents finish). If upstream was
 installed by a different Git/local source, remove that exact source instead.
 The fork loads src/index.ts; Git installation does not depend on an untracked dist.
-Update with pi update. Never install the npm name above expecting this private fork.
+Update with pi update --extensions. Do not install the fork's unpublished npm name.
 
 ## Completion contract
 
@@ -191,19 +140,18 @@ results. Consumed results retain upstream's completion-age cleanup policy.
 - #321 (c89d72a): ONLY widget cadence/idle-stop and its tests; unrelated changes omitted.
 
 Upstream PRs: https://github.com/tintinweb/pi-subagents/pulls
-Pi delivery implementation: https://github.com/earendil-works/pi/blob/v0.87.1/packages/coding-agent/src/core/agent-session.ts
+Pi implementation: https://github.com/earendil-works/pi/blob/v0.87.1/packages/coding-agent/src/core/agent-session.ts
 Original MIT license and author attribution are preserved.
 
 ## Validation
 
 Run npm ci, npm run check, npm run build, and npm run test:e2e.
-Tests use scripted providers and do not require paid model calls. Required CI
-runs on Linux/Node 22/Pi 0.87.1; latest Pi is a non-blocking compatibility canary.
+Tests use scripted providers and do not require paid model calls.
 Manual Windows/macOS terminal and live-provider behavior are not certified by CI.
-The passive-completion tests exercise idle delivery, complete tool-batch ordering,
-no forced final-answer continuation, consumption, grouping, resume and shutdown.
+Passive-completion tests cover idle delivery, tool-batch ordering, no forced
+final-answer continuation, consumption, grouping, resume and shutdown.
 `);
-  const forkIntro = `# AHGGG pi-subagents — personal V1 fork
+  put('README.md', `# AHGGG pi-subagents — personal V1 fork
 
 **Install this fork from Git, not the upstream npm package. Requires Pi >= 0.87.1.**
 
@@ -221,16 +169,13 @@ supersedes its automatic-wakeup and smart-default descriptions.
 
 ---
 
-`;
-  put('README.md', forkIntro + read('README.md'));
+` + read('README.md'));
 
   put('test/passive-completion-wiring.test.ts', String.raw`import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
   return { ...actual, runAgent: vi.fn(), resumeAgent: vi.fn() };
 });
-
 import { resumeAgent, runAgent } from "../src/agent-runner.js";
 import subagents from "../src/index.js";
 import { ctx, hermeticDir, makePi, textOf } from "./helpers/boot-extension.js";
@@ -242,7 +187,6 @@ describe("V1 passive completion wiring", () => {
   const releases: Array<() => void> = [];
   const completed = () => ({ responseText: "CHILD-RESULT", session: { dispose: vi.fn(), messages: [] }, aborted: false, steered: false });
   const manager = () => (globalThis as any)[Symbol.for("pi-subagents:manager")];
-
   beforeEach(() => {
     vi.useFakeTimers();
     env = hermeticDir({ settings: { schedulingEnabled: false, rememberAgents: false, outputTranscript: false } });
@@ -279,20 +223,17 @@ describe("V1 passive completion wiring", () => {
   async function consume(id: string) {
     return boot.tools.get("get_subagent_result").execute("get", { agent_id: id, wait: false }, undefined, undefined, context);
   }
-
   it("appends an individual completion passively without consuming its result", async () => {
     await start();
     const id = await spawn();
     await vi.advanceTimersByTimeAsync(400);
     expect(boot.pi.sendMessage).toHaveBeenCalledOnce();
     expect(boot.pi.sendMessage).toHaveBeenCalledWith(expect.objectContaining({
-      customType: "subagent-notification", display: true,
-      content: expect.stringContaining(id),
+      customType: "subagent-notification", display: true, content: expect.stringContaining(id),
     }), { triggerTurn: false });
     expect(manager().getRecord(id).resultConsumed).toBeFalsy();
     expect(textOf(await consume(id))).toContain("CHILD-RESULT");
   });
-
   it("defaults to async: a fast child does not wait for a slow sibling", async () => {
     await start();
     vi.mocked(runAgent).mockResolvedValueOnce(completed() as any).mockImplementationOnce(() => new Promise(resolve => {
@@ -304,7 +245,6 @@ describe("V1 passive completion wiring", () => {
     expect(boot.pi.sendMessage).toHaveBeenCalledOnce();
     expect(boot.pi.sendMessage.mock.calls[0][0].content).toContain(first);
   });
-
   it("suppresses a result retrieved inside the hold", async () => {
     await start();
     const id = await spawn();
@@ -313,7 +253,6 @@ describe("V1 passive completion wiring", () => {
     await vi.advanceTimersByTimeAsync(400);
     expect(boot.pi.sendMessage).not.toHaveBeenCalled();
   });
-
   it("retains explicit smart grouping and removes consumed members", async () => {
     await start("smart");
     const first = await spawn("first");
@@ -328,7 +267,6 @@ describe("V1 passive completion wiring", () => {
     expect(message.content).toContain(second);
     expect(message.content).not.toContain(first);
   });
-
   it("does not deliver the previous completion while the same agent is resumed", async () => {
     await start();
     const id = await spawn();
@@ -342,7 +280,6 @@ describe("V1 passive completion wiring", () => {
     await vi.advanceTimersByTimeAsync(400);
     expect(boot.pi.sendMessage).not.toHaveBeenCalled();
   });
-
   it("drops undelivered completions on shutdown", async () => {
     await start();
     await spawn();
@@ -352,7 +289,6 @@ describe("V1 passive completion wiring", () => {
   });
 });
 `);
-
   put('test/e2e/passive-completion.e2e.test.ts', String.raw`import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -362,7 +298,6 @@ import { Type } from "@sinclair/typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fauxModelBackend } from "../helpers/faux-model-backend.js";
 import { registerFauxProvider } from "../helpers/pi-ai.js";
-
 vi.setConfig({ testTimeout: 30_000 });
 const MARKER = "SUBAGENT-READY-PASSIVE";
 const notice = { customType: "subagent-notification", content: MARKER, display: true };
@@ -371,7 +306,6 @@ function gate() {
   const promise = new Promise<void>(r => { resolve = r; });
   return { promise, resolve };
 }
-
 describe("passive completions against real Pi", () => {
   let cwd: string;
   let faux: ReturnType<typeof registerFauxProvider>;
@@ -404,7 +338,6 @@ describe("passive completions against real Pi", () => {
     } as any));
     return session!;
   }
-
   it("does not wake an idle parent; its next user request includes the notice", async () => {
     const requests: any[] = [];
     faux.setResponses([context => {
@@ -419,7 +352,6 @@ describe("passive completions against real Pi", () => {
     expect(requests).toHaveLength(1);
     expect(JSON.stringify(requests[0].messages)).toContain(MARKER);
   });
-
   it("finishes the entire tool batch and exposes the notice on the next natural request", async () => {
     const entered = gate();
     const release = gate();
@@ -455,7 +387,6 @@ describe("passive completions against real Pi", () => {
     expect(toolIndex).toBeGreaterThanOrEqual(0);
     expect(noticeIndex).toBeGreaterThan(toolIndex);
   });
-
   it("does not force another request when completion arrives during a final answer", async () => {
     const entered = gate();
     const release = gate();
@@ -479,9 +410,6 @@ describe("passive completions against real Pi", () => {
   });
 });
 `);
-
-  // Existing wiring assertions must describe the intentional passive-delivery
-  // contract. Functional assertions and provider scripts stay unchanged.
   function walk(path) {
     return readdirSync(path, { withFileTypes: true }).flatMap(e => e.isDirectory() ? walk(join(path, e.name)) : [join(path, e.name)]);
   }
@@ -498,9 +426,7 @@ describe("passive completions against real Pi", () => {
 } else {
   run('npm', ['ci']);
 }
-
-// Never update master from this temporary runner. The reviewed v1 branch is
-// promoted separately only after inspecting the completed checks.
+if (existsSync(new URL('./fix.mjs', import.meta.url))) await import('./fix.mjs');
 delete process.env.PI_E2E_LIVE;
 run('npm', ['run', 'check']);
 run('npm', ['run', 'build']);
