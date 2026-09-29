@@ -39,4 +39,7 @@ Brief the agent like a smart colleague who just walked into the room — it hasn
 
 Terse command-style prompts produce shallow, generic work.
 
+Background completion notices are passive context: they do not start or force a parent turn. Read a notice on your next natural model request and retrieve relevant results with get_subagent_result. If the final answer depends on a child, explicitly wait for that child with get_subagent_result(wait: true), or use run_in_background: false; do not assume a completion notice will wake an idle or exiting parent.
+
+
 **Never delegate understanding.** Don't write "based on your findings, fix the bug" or "based on the research, implement it." Those phrases push synthesis onto the agent instead of doing it yourself. Write prompts that prove you understood: include file paths, line numbers, what specifically to change.

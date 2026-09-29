@@ -447,6 +447,7 @@ export default function (pi: ExtensionAPI) {
   // ---- Cancellable pending notifications ----
   // Holds notifications briefly so get_subagent_result can cancel them
   // before they reach pi.sendMessage (fire-and-forget).
+  let shuttingDown = false;
   const pendingNudges = new Map<string, ReturnType<typeof setTimeout>>();
   const NUDGE_HOLD_MS = 200;
   // A queued result wait must observe completion before its held notification
@@ -454,6 +455,7 @@ export default function (pi: ExtensionAPI) {
   const QUEUE_WAIT_POLL_MS = Math.floor(NUDGE_HOLD_MS / 4);
 
   function scheduleNudge(key: string, send: () => void, delay = NUDGE_HOLD_MS) {
+    if (shuttingDown) return;
     cancelNudge(key);
     pendingNudges.set(key, setTimeout(() => {
       pendingNudges.delete(key);
@@ -469,26 +471,38 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  // Retained completions are snapshots, not mutable records for resumed runs.
+  // Promise identity distinguishes executions even when timestamps coincide.
+  function isUnreadCompletion(completion: AgentRecord): boolean {
+    if (shuttingDown) return false;
+    const live = manager.getRecord(completion.id);
+    return !!live && !live.resultConsumed
+      && live.status !== "running" && live.status !== "queued"
+      && live.promise === completion.promise
+      && live.completedAt === completion.completedAt;
+  }
+
   // ---- Individual nudge helper (async join mode) ----
   function emitIndividualNudge(record: AgentRecord) {
-    if (record.resultConsumed) return;  // re-check at send time
+    if (!isUnreadCompletion(record)) return; // Re-check consumption and execution.
 
     const notification = formatTaskNotification(record, 500, showCost);
     const footer = record.outputFile ? `\nFull transcript available at: ${record.outputFile}` : '';
 
     pi.sendMessage<NotificationDetails>({
       customType: "subagent-notification",
-      content: notification + footer,
+      content: notification + footer + "\nResult ready. Retrieve full output with get_subagent_result({ agent_id: " + JSON.stringify(record.id) + ", wait: false }). This notice does not mean the result has been consumed.",
       display: true,
       details: buildNotificationDetails(record, 500, agentActivity.get(record.id)),
-    }, { deliverAs: "followUp", triggerTurn: true });
+    }, { triggerTurn: false });
   }
 
   function sendIndividualNudge(record: AgentRecord) {
     agentActivity.delete(record.id);
     widget.markFinished(record.id);
     fleet.onAgentFinished(record.id);
-    scheduleNudge(record.id, () => emitIndividualNudge(record));
+    const completion = { ...record };
+    scheduleNudge(record.id, () => emitIndividualNudge(completion));
     widget.update();
   }
 
@@ -500,7 +514,7 @@ export default function (pi: ExtensionAPI) {
       const groupKey = `group:${records.map(r => r.id).join(",")}`;
       scheduleNudge(groupKey, () => {
         // Re-check at send time
-        const unconsumed = records.filter(r => !r.resultConsumed);
+        const unconsumed = records.filter(isUnreadCompletion);
         if (unconsumed.length === 0) { widget.update(); return; }
 
         const notifications = unconsumed.map(r => formatTaskNotification(r, 300, showCost)).join('\n\n');
@@ -519,7 +533,7 @@ export default function (pi: ExtensionAPI) {
           content: `Background agent group completed: ${label}\n\n${notifications}\n\nUse get_subagent_result for full output.`,
           display: true,
           details,
-        }, { deliverAs: "followUp", triggerTurn: true });
+        }, { triggerTurn: false });
       });
       widget.update();
     },
@@ -566,6 +580,7 @@ export default function (pi: ExtensionAPI) {
 
   // Background completion: route through group join or send individual nudge
   const manager = new AgentManager((record) => {
+    if (shuttingDown) return;
     // Owned children — nested, or a workflow's — report only through their
     // owner: the parent's scoped tools, or the workflow's card, notification
     // and dialog. Keep them out of top-level lifecycle, transcript,
@@ -1095,6 +1110,7 @@ export default function (pi: ExtensionAPI) {
   // On shutdown, abort all agents immediately and clean up.
   // If the session is going down, there's nothing left to consume agent results.
   pi.on("session_shutdown", async () => {
+    shuttingDown = true;
     rpcHandle?.unsubSpawn();
     rpcHandle?.unsubStop();
     rpcHandle?.unsubPing();
@@ -1172,7 +1188,7 @@ export default function (pi: ExtensionAPI) {
   // is silent, this default applies. Read live at spawn time.
 
   // ---- Join mode configuration ----
-  let defaultJoinMode: JoinMode = 'smart';
+  let defaultJoinMode: JoinMode = 'async';
   function getDefaultJoinMode(): JoinMode { return defaultJoinMode; }
   function setDefaultJoinMode(mode: JoinMode) { defaultJoinMode = mode; }
 
@@ -1537,6 +1553,9 @@ Brief the agent like a smart colleague who just walked into the room — it hasn
 - Lookups: hand over the exact command. Investigations: hand over the question — prescribed steps become dead weight when the premise is wrong.
 
 Terse command-style prompts produce shallow, generic work.
+
+Background completion notices are passive context: they do not start or force a parent turn. Read a notice on your next natural model request and retrieve relevant results with get_subagent_result. If the final answer depends on a child, explicitly wait for that child with get_subagent_result(wait: true), or use run_in_background: false; do not assume a completion notice will wake an idle or exiting parent.
+
 
 **Never delegate understanding.** Don't write "based on your findings, fix the bug" or "based on the research, implement it." Those phrases push synthesis onto the agent instead of doing it yourself. Write prompts that prove you understood: include file paths, line numbers, what specifically to change.`;
 
@@ -2394,10 +2413,11 @@ Terse command-style prompts produce shallow, generic work.
 
   /**
    * Hand a finished run back to the model through the SAME channel a background
-   * agent uses — held briefly by `scheduleNudge`, delivered as a follow-up that
-   * triggers a turn, rendered by the existing `subagent-notification` renderer.
+   * agent uses — held briefly by `scheduleNudge`, appended as passive context
+   * without starting a turn, rendered by the existing notification renderer.
    */
   function notifyWorkflowFinished(task: WorkflowTask) {
+    if (shuttingDown || !workflowTasks.has(task.id)) return;
     widget.update();
     fleet.update();
     const result = workflowResultText(task);
@@ -2418,7 +2438,7 @@ Terse command-style prompts produce shallow, generic work.
           error: task.error,
           resultPreview: result.length > 500 ? `${result.slice(0, 500)}…` : result,
         },
-      }, { deliverAs: "followUp", triggerTurn: true });
+      }, { triggerTurn: false });
     });
   }
 

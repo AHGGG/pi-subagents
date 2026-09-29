@@ -1,16 +1,16 @@
 {
-  "name": "@tintinweb/pi-subagents",
-  "version": "0.19.0",
-  "description": "A pi extension that brings Claude Code-like sub-agents and workflow orchestration to pi — parallel execution, live widget, fleet view, custom agent types, mid-run steering, dynamic workflows, Claude Code compatibility, look and feel.",
+  "name": "@ahggg/pi-subagents",
+  "version": "0.19.0-ahggg.1",
+  "description": "Personal V1 fork: reliable subagents with passive completion notifications for Pi",
   "author": "tintinweb",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/tintinweb/pi-subagents.git"
+    "url": "https://github.com/AHGGG/pi-subagents.git"
   },
-  "homepage": "https://github.com/tintinweb/pi-subagents#readme",
+  "homepage": "https://github.com/AHGGG/pi-subagents#readme",
   "bugs": {
-    "url": "https://github.com/tintinweb/pi-subagents/issues"
+    "url": "https://github.com/AHGGG/pi-subagents/issues"
   },
   "publishConfig": {
     "access": "public"
@@ -24,9 +24,9 @@
     "autonomous"
   ],
   "peerDependencies": {
-    "@earendil-works/pi-ai": ">=0.84.0",
-    "@earendil-works/pi-coding-agent": ">=0.84.0",
-    "@earendil-works/pi-tui": ">=0.84.0"
+    "@earendil-works/pi-ai": ">=0.87.1",
+    "@earendil-works/pi-coding-agent": ">=0.87.1",
+    "@earendil-works/pi-tui": ">=0.87.1"
   },
   "dependencies": {
     "@sinclair/typebox": "^0.34.49",
@@ -50,9 +50,9 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.14",
-    "@earendil-works/pi-ai": "0.84.2",
-    "@earendil-works/pi-coding-agent": "0.84.2",
-    "@earendil-works/pi-tui": "0.84.2",
+    "@earendil-works/pi-ai": "0.87.1",
+    "@earendil-works/pi-coding-agent": "0.87.1",
+    "@earendil-works/pi-tui": "0.87.1",
     "@types/node": "^25.5.0",
     "@vitest/coverage-istanbul": "^4.1.10",
     "typescript": "^6.0.0",
@@ -64,5 +64,6 @@
     ],
     "video": "https://github.com/tintinweb/pi-subagents/raw/master/media/demo.mp4",
     "image": "https://github.com/tintinweb/pi-subagents/raw/master/media/screenshot.png"
-  }
+  },
+  "private": true
 }
