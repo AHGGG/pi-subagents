@@ -1,4 +1,4 @@
-# AHGGG pi-subagents — personal V1 fork
+# AHGGG pi-subagents — personal fork
 
 **Install this fork from Git, not the upstream npm package. Requires Pi >= 0.87.1.**
 
@@ -6,13 +6,22 @@
 
 Remove any installed upstream copy first. See [fork installation and behavior](docs/FORK_V1.md).
 
-V1 adds passive completion notices, async join by default, unread result retention,
-resumable foreground IDs, shutdown cleanup and an idle-safe 250ms widget tick.
-Notices reach the next natural model request without interrupting tools or waking
-an idle parent. Tasks that require a child result must still join it explicitly.
+**Current version: 0.19.0-ahggg.2. Automatic wake-up is restored.**
+Completion notices are queued after the current tool batch for the next model
+request. An idle main agent wakes automatically; a completion arriving during
+a text-only final answer also requests continuation while Pi remains open.
+V1 reliability fixes remain: async join by default, unread-result retention,
+resumable IDs, shutdown cleanup, stale-run filtering and the idle-safe widget.
 
-The upstream documentation below is retained for reference; the V1 contract above
-supersedes its automatic-wakeup and smart-default descriptions.
+Already installed? Run `pi update --extensions`, then restart Pi after any
+running agents finish. Do not load the upstream package alongside this fork.
+
+Stopping the parent alone does not cancel detached children or prevent their
+later notices from waking it. Stop unwanted children through `/agents`. One-shot
+headless commands must still explicitly join required results before exiting.
+
+The upstream documentation below is retained for reference. The fork contract
+in `docs/FORK_V1.md` takes precedence, notably async default and earlier delivery.
 
 ---
 

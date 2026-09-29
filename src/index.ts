@@ -22,6 +22,7 @@ import { AgentManager, isTopLevelAgent } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
+import { COMPLETION_DELIVERY_OPTIONS } from "./completion-delivery.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { GroupJoinManager } from "./group-join.js";
@@ -494,7 +495,7 @@ export default function (pi: ExtensionAPI) {
       content: notification + footer + "\nResult ready. Retrieve full output with get_subagent_result({ agent_id: " + JSON.stringify(record.id) + ", wait: false }). This notice does not mean the result has been consumed.",
       display: true,
       details: buildNotificationDetails(record, 500, agentActivity.get(record.id)),
-    }, { triggerTurn: false });
+    }, COMPLETION_DELIVERY_OPTIONS);
   }
 
   function sendIndividualNudge(record: AgentRecord) {
@@ -539,7 +540,7 @@ export default function (pi: ExtensionAPI) {
           content: `Background agent group completed: ${label}\n\n${notifications}\n\nUse get_subagent_result for full output.`,
           display: true,
           details,
-        }, { triggerTurn: false });
+        }, COMPLETION_DELIVERY_OPTIONS);
       });
       widget.update();
     },
@@ -1564,7 +1565,7 @@ Brief the agent like a smart colleague who just walked into the room — it hasn
 
 Terse command-style prompts produce shallow, generic work.
 
-Background completion notices are passive context: they do not start or force a parent turn. Read a notice on your next natural model request and retrieve relevant results with get_subagent_result. If the final answer depends on a child, explicitly wait for that child with get_subagent_result(wait: true), or use run_in_background: false; do not assume a completion notice will wake an idle or exiting parent.
+Background completion notices reach your next model request after the current tool batch. If you are idle or finishing a text-only answer, a completion can automatically continue the conversation while Pi remains open. Retrieve relevant full results with get_subagent_result; a notification does not consume the result. If your final answer must include a child result, explicitly wait with get_subagent_result(wait: true) or use run_in_background: false, especially in one-shot/headless mode. Never treat a missing notice as proof that a child is still running.
 
 
 **Never delegate understanding.** Don't write "based on your findings, fix the bug" or "based on the research, implement it." Those phrases push synthesis onto the agent instead of doing it yourself. Write prompts that prove you understood: include file paths, line numbers, what specifically to change.`;
@@ -2423,8 +2424,8 @@ Background completion notices are passive context: they do not start or force a 
 
   /**
    * Hand a finished run back to the model through the SAME channel a background
-   * agent uses — held briefly by `scheduleNudge`, appended as passive context
-   * without starting a turn, rendered by the existing notification renderer.
+   * agent uses — held briefly by `scheduleNudge`, queued at the next model
+   * boundary (or waking an idle parent), using the existing notification renderer.
    */
   function notifyWorkflowFinished(task: WorkflowTask) {
     if (shuttingDown || !workflowTasks.has(task.id)) return;
@@ -2448,7 +2449,7 @@ Background completion notices are passive context: they do not start or force a 
           error: task.error,
           resultPreview: result.length > 500 ? `${result.slice(0, 500)}…` : result,
         },
-      }, { triggerTurn: false });
+      }, COMPLETION_DELIVERY_OPTIONS);
     });
   }
 
