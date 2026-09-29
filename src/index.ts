@@ -1281,6 +1281,9 @@ export default function (pi: ExtensionAPI) {
       for (const id of ids) {
         const record = manager.getRecord(id);
         if (!record) continue;
+        // Fast runs can settle during awaitStartup, before batch registration.
+        // The group now owns delivery: retract the individual hold first.
+        cancelNudge(id);
         record.groupId = groupId;
         if (record.completedAt != null && !record.resultConsumed) {
           groupJoin.onAgentComplete(record);
