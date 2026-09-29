@@ -64,8 +64,11 @@
 import type { Model } from "@earendil-works/pi-ai";
 import {
   buildSessionContext,
+  convertToLlm,
   createAgentSession,
+  DefaultResourceLoader,
   type ExtensionContext,
+  getAgentDir,
   SessionManager,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
@@ -146,12 +149,35 @@ export async function runMentionClone(opts: MentionCloneOptions): Promise<Mentio
     // the settings level instead, which is what a session that never ran
     // `/think` is on anyway. Same shim shape as `modelRuntime` below.
     const thinkingLevel = (ctx as { thinkingLevel?: ThinkingLevel }).thinkingLevel;
-    const created = await runInChildSessionContext(() =>
-      createAgentSession({
+    const sessionManager = SessionManager.inMemory(ctx.cwd);
+    for (const entry of conversation.messages) {
+      // The live prompt is copied below. Do not replay the parent's system
+      // messages: newer Pi also stores its tool declarations there.
+      if ((entry.role as string) === "system") continue;
+      // Summary messages are projections, not appendable session entries.
+      // Preserve exactly the user message Pi would send for each summary.
+      if (entry.role === "compactionSummary" || entry.role === "branchSummary") {
+        for (const message of convertToLlm([entry])) sessionManager.appendMessage(message);
+      } else {
+        sessionManager.appendMessage(entry);
+      }
+    }
+    const systemPrompt = ctx.getSystemPrompt?.();
+    const created = await runInChildSessionContext(async () => {
+      const resourceLoader = new DefaultResourceLoader({
+        cwd: ctx.cwd,
+        agentDir: getAgentDir(),
+        extensionFactories: [pi => {
+          pi.on("before_agent_start", () => systemPrompt ? { systemPrompt } : undefined);
+        }],
+      });
+      await resourceLoader.reload();
+      return createAgentSession({
         cwd: ctx.cwd,
         // Nothing about the copy is worth persisting, and an in-memory manager
         // is also what keeps the real session untouched.
-        sessionManager: SessionManager.inMemory(ctx.cwd),
+        sessionManager,
+        resourceLoader,
         model: ctx.model as Model<never> | undefined,
         ...(thinkingLevel && { thinkingLevel }),
         modelRegistry: ctx.modelRegistry,
@@ -166,20 +192,9 @@ export async function runMentionClone(opts: MentionCloneOptions): Promise<Mentio
         // agent-runner's `tools: sessionTools` beside its nested `customTools`.
         tools: [cloneAgentTool.name],
         customTools: [cloneAgentTool],
-      } as Parameters<typeof createAgentSession>[0]),
-    );
+      } as Parameters<typeof createAgentSession>[0]);
+    });
     session = created.session;
-
-    // The clone rebuilds a system prompt from cwd and agentDir, which is close
-    // but not the live one — extensions contribute to it per turn. Copy the
-    // real thing, so the copy reasons under the instructions the user's model
-    // is actually working under.
-    const systemPrompt = ctx.getSystemPrompt?.();
-    if (systemPrompt) session.agent.state.systemPrompt = systemPrompt;
-
-    // The conversation itself. Pushed rather than assigned so the array the
-    // session was built around stays the one it goes on using.
-    session.agent.state.messages.push(...conversation.messages);
 
     // User text first, reminder after — the order Claude Code's attachment
     // renderer produces, where the reminder trails the message it is about.
