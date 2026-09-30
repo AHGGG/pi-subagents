@@ -347,6 +347,7 @@ describe("AgentManager — nested runtime propagation", () => {
   });
 
   it("gives a workflow's child no handle, so nothing can address it", () => {
+    manager = new AgentManager();
     // Same reasoning as a nested child: it is filtered out of every top-level
     // surface, so a handle would name something unreachable and consume a name
     // a visible agent could have taken.
@@ -1477,25 +1478,30 @@ describe("AgentManager — abortAll", () => {
   let manager: AgentManager;
   afterEach(() => manager?.dispose());
 
-  it("stops both queued and running agents and returns the total count", () => {
+  it("stops both queued and running agents and waits for active finalization", async () => {
     manager = new AgentManager(undefined, 1);
-    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
-
-    const running = manager.spawn(mockPi, mockCtx, "X", "r", {
-      description: "r",
-      isBackground: true,
-    });
-    const queued = manager.spawn(mockPi, mockCtx, "Y", "q", {
-      description: "q",
-      isBackground: true,
-    });
+    let finish!: () => void;
+    vi.mocked(runAgent).mockImplementation(() => new Promise(resolve => {
+      finish = () => resolve({ responseText: "stopped output", session: mockSession(), aborted: true, steered: false } as any);
+    }));
+    const running = manager.spawn(mockPi, mockCtx, "X", "r", { description: "r", isBackground: true });
+    const queued = manager.spawn(mockPi, mockCtx, "Y", "q", { description: "q", isBackground: true });
     expect(manager.getRecord(running)?.status).toBe("running");
     expect(manager.getRecord(queued)?.status).toBe("queued");
-
-    expect(manager.abortAll()).toBe(2);
-    expect(manager.getRecord(running)?.status).toBe("stopped");
-    expect(manager.getRecord(queued)?.status).toBe("stopped");
-    expect(manager.hasRunning()).toBe(false);
+    try {
+      expect(manager.abortAll()).toBe(2);
+      expect(manager.getRecord(running)?.status).toBe("stopped");
+      expect(manager.getRecord(queued)?.status).toBe("stopped");
+      expect(manager.getRecord(queued)?.runSettled).toBe(true);
+      // Stop requests do not magically finish asynchronous cleanup. Keep the
+      // running execution reachable until its result and preservation settle.
+      expect(manager.hasRunning()).toBe(true);
+      finish();
+      await manager.waitForResult(running);
+      expect(manager.hasRunning()).toBe(false);
+      expect(manager.getRecord(running)?.runSettled).toBe(true);
+      expect(manager.getRecord(running)?.result).toBe("stopped output");
+    } finally { finish(); }
   });
 
   it("returns 0 when there are no running or queued agents", () => {
@@ -2157,7 +2163,7 @@ describe("AgentManager — background resume", () => {
     expect(resumeAgent).not.toHaveBeenCalled();
   });
 
-  it("foreground resume is unchanged: awaits inline and does not fire onComplete", async () => {
+  it("foreground resume awaits inline and finalizes with its result consumed", async () => {
     const onComplete = vi.fn();
     manager = new AgentManager(onComplete);
     const id = await spawnSettled(manager);
@@ -2168,8 +2174,10 @@ describe("AgentManager — background resume", () => {
 
     expect(record?.status).toBe("completed");
     expect(record?.result).toBe("inline result");
-    // Foreground resume returns its result inline and never notified (historical).
-    expect(onComplete).not.toHaveBeenCalled();
+    // Lifecycle/history now sees every final outcome; consumption suppresses
+    // a redundant background notification for the result returned inline.
+    expect(onComplete).toHaveBeenCalledOnce();
+    expect(onComplete).toHaveBeenCalledWith(expect.objectContaining({ resultConsumed: true, runSettled: true, result: "inline result" }));
   });
 
   // A detached resume returns while the record is still "running", so nothing

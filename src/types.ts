@@ -5,6 +5,7 @@
 import type { ThinkingLevel } from "@earendil-works/pi-ai";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import type { LifetimeUsage } from "./usage.js";
+import type { WorktreeCleanupResult } from "./worktree.js";
 
 export type { ThinkingLevel };
 
@@ -154,6 +155,10 @@ export type MentionResolution =
   | { kind: "tombstone"; entry: AgentTombstone };
 
 export interface AgentRecord {
+  /** Identity of the current execution; an agent ID can be resumed repeatedly. */
+  runId?: string;
+  /** False until execution and required finalization have both finished. */
+  runSettled?: boolean;
   id: string;
   type: SubagentType;
   /**
@@ -205,7 +210,7 @@ export interface AgentRecord {
   /** Worktree info if the agent is running in an isolated worktree. */
   worktree?: { path: string; branch: string; baseSha: string; workPath: string };
   /** Worktree cleanup result after agent completion. */
-  worktreeResult?: { hasChanges: boolean; branch?: string };
+  worktreeResult?: WorktreeCleanupResult;
   /** The tool_use_id from the original Agent tool call. */
   toolCallId?: string;
   /** Path to the streaming output transcript file. */

@@ -15,7 +15,6 @@ import { isAbsolute, join } from "node:path";
 import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Key, matchesKey, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { abortable } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, serializeAgentFile } from "./agent-file-toggle.js";
 import { AgentManager, isTopLevelAgent } from "./agent-manager.js";
@@ -33,6 +32,7 @@ import { describeModel, type ModelRegistry, resolveModel } from "./model-resolve
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
+import { findSavedResult, formatSavedResult, RESULT_ENTRY, RUN_START_ENTRY, snapshotRun } from "./result-history.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
@@ -451,9 +451,6 @@ export default function (pi: ExtensionAPI) {
   let shuttingDown = false;
   const pendingNudges = new Map<string, ReturnType<typeof setTimeout>>();
   const NUDGE_HOLD_MS = 200;
-  // A queued result wait must observe completion before its held notification
-  // can fire, so successful waits can still suppress that redundant nudge.
-  const QUEUE_WAIT_POLL_MS = Math.floor(NUDGE_HOLD_MS / 4);
 
   function scheduleNudge(key: string, send: () => void, delay = NUDGE_HOLD_MS) {
     if (shuttingDown) return;
@@ -478,7 +475,8 @@ export default function (pi: ExtensionAPI) {
     if (shuttingDown) return false;
     const live = manager.getRecord(completion.id);
     return !!live && !live.resultConsumed
-      && live.status !== "running" && live.status !== "queued"
+      && !manager.isRunPending(live)
+      && live.runId === completion.runId
       && live.promise === completion.promise
       && live.completedAt === completion.completedAt;
   }
@@ -603,12 +601,7 @@ export default function (pi: ExtensionAPI) {
       pi.events.emit("subagents:completed", eventData);
     }
 
-    // Persist final record for cross-extension history reconstruction
-    pi.appendEntry("subagents:record", {
-      id: record.id, type: record.type, description: record.description,
-      status: record.status, result: record.result, error: record.error,
-      startedAt: record.startedAt, completedAt: record.completedAt,
-    });
+    // Final results are recorded by the manager run observer, before notifications.
 
     // Skip notification if result was already consumed via get_subagent_result
     if (record.resultConsumed) {
@@ -773,6 +766,17 @@ export default function (pi: ExtensionAPI) {
 
   // --- Cross-extension RPC via pi.events ---
   let currentCtx: ExtensionContext | undefined;
+  manager.setRunObserver(record => {
+    if (shuttingDown || !currentCtx || !isTopLevelAgent(record)) return;
+    const sessionId = currentCtx.sessionManager.getSessionId();
+    if (record.rootSessionId !== undefined && record.rootSessionId !== sessionId) {
+      console.warn("[pi-subagents] Refusing to record an execution in a different parent session: " + record.id);
+      return;
+    }
+    // Run starts are recorded at acceptance, including queued resumes. A newer
+    // unfinished run therefore blocks recovery of a previous run's answer.
+    pi.appendEntry(record.runSettled ? RESULT_ENTRY : RUN_START_ENTRY, snapshotRun(record, sessionId));
+  });
   // RPC handlers + the `subagents:ready` broadcast are wired on `session_start`
   // (a bound lifecycle event), not at factory time. pi runs every extension
   // factory before the `extensions:` filter and only fires lifecycle events for
@@ -836,7 +840,7 @@ export default function (pi: ExtensionAPI) {
             // to consume, and its notification is still the caller's only
             // signal that it finished.
             if (!record || record.parentAgentId) return false;
-            if (record.status === "running" || record.status === "queued") return false;
+            if (manager.isRunPending(record)) return false;
             record.resultConsumed = true;
             cancelNudge(record.id);
             return true;
@@ -2016,6 +2020,9 @@ Background completion notices reach your next model request after the current to
         if (!existing || !isTopLevelAgent(existing)) {
           return textResult(`Agent not found: "${params.resume}". It may have been cleaned up.`);
         }
+        if (manager.isRunPending(existing)) {
+          return textResult(`Agent "${params.resume}" is still running, queued, or finalizing. Use get_subagent_result with wait: true before resuming, or steer_subagent while it is actively running.`);
+        }
         if (!existing.session) {
           return textResult(`Agent "${params.resume}" has no active session to resume.`);
         }
@@ -2784,7 +2791,7 @@ Background completion notices reach your next model request after the current to
     name: SUBAGENT_TOOL_NAMES.GET_RESULT,
     label: "Get Agent Result",
     description:
-      "Check status and retrieve a background agent's full result — its completion notification carries only a preview. Use the agent ID returned by Agent.",
+      "Check status and retrieve a background agent's full result — its completion notification carries only a preview. Use the exact agent ID returned by Agent. If its live record was cleaned up, a saved final result can be recovered from this session branch.",
     promptSnippet: "Check status and retrieve results from a background agent",
     parameters: Type.Object({
       agent_id: Type.String({
@@ -2803,24 +2810,28 @@ Background completion notices reach your next model request after the current to
     }),
     execute: async (_toolCallId, params, signal, _onUpdate, _ctx) => {
       const record = resolveAgentRef(params.agent_id);
-      if (!record || !isTopLevelAgent(record)) {
-        return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
+      if (record && !isTopLevelAgent(record)) {
+        return textResult(`Agent not found or not accessible: "` + params.agent_id + `". Use the owning agent or workflow to access its result.`);
+      }
+      if (!record) {
+        const history = findSavedResult(_ctx.sessionManager?.getBranch?.() ?? [], params.agent_id, _ctx.sessionManager?.getSessionId?.() ?? "");
+        if (history.kind === "found") {
+          return {
+            content: [{ type: "text" as const, text: formatSavedResult(history.result, !!params.verbose) }],
+            details: { source: "session-history", agentId: history.result.id, runId: history.result.runId, status: history.result.status },
+          };
+        }
+        if (history.kind === "unfinished") {
+          return textResult("No finalized result is recorded for the latest execution of " + params.agent_id + ". Its live record is unavailable; an older answer will not be substituted.");
+        }
+        return textResult("Agent not found: " + JSON.stringify(params.agent_id) +
+          (history.kind === "invalid" ? ". The saved record failed validation or scope checks." : ". No live record or saved result exists for this exact ID in the current session branch. Check the original launch/completion ID."));
       }
 
-      // Wait for completion if requested. Cancellation stops only this tool
-      // call; the background agent keeps running and remains unconsumed so its
-      // completion notification can still be delivered.
-      // Queued agents have no promise yet (it's created when the queue starts
-      // them), so poll until they leave the queue, then await like a running one.
-      if (params.wait && (record.status === "running" || record.status === "queued")) {
-        while (record.status === "queued") {
-          await abortable(
-            new Promise<void>((resolve) => setTimeout(resolve, QUEUE_WAIT_POLL_MS)),
-            signal,
-          );
-        }
-        if (record.promise) await abortable(record.promise, signal);
-      }
+      // Waiting includes startup and finalization, not just model generation.
+      // Aborting this waiter does not abort a detached child's execution.
+      if (params.wait && manager.isRunPending(record)) await manager.waitForResult(record.id, signal);
+      const pending = manager.isRunPending(record);
 
       const displayName = getDisplayName(record.type);
       const duration = formatDuration(record.startedAt, record.completedAt);
@@ -2841,8 +2852,8 @@ Background completion notices reach your next model request after the current to
         `Type: ${displayName} | Status: ${record.status}${getStatusNote(record.status)} | ${statsParts.join(" | ")}\n` +
         `Description: ${record.description}\n\n`;
 
-      if (record.status === "running") {
-        output += "Agent is still running. Use wait: true or check back later.";
+      if (pending) {
+        output += "Agent is still running, queued, stopping, or finalizing. Use wait: true for the finalized result.";
       } else if (record.status === "error") {
         output += `Error: ${record.error}${partialOutputSuffix(record)}`;
       } else {
@@ -2850,9 +2861,9 @@ Background completion notices reach your next model request after the current to
       }
 
       // Mark result as consumed — suppresses the completion notification
-      if (record.status !== "running" && record.status !== "queued") {
+      if (!pending) {
         record.resultConsumed = true;
-        cancelNudge(params.agent_id);
+        cancelNudge(record.id);
       }
 
       // Verbose: include full conversation
@@ -2887,7 +2898,7 @@ Background completion notices reach your next model request after the current to
     execute: async (_toolCallId, params, _signal, _onUpdate, _ctx) => {
       const record = resolveAgentRef(params.agent_id);
       if (!record || !isTopLevelAgent(record)) {
-        return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
+        return textResult(`Agent not found or not accessible: "${params.agent_id}". Steering requires a live agent owned by this session.`);
       }
       if (record.status !== "running") {
         return textResult(`Agent "${params.agent_id}" is not running (status: ${record.status}). Cannot steer a non-running agent.`);

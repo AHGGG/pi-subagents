@@ -1,6 +1,9 @@
 # AHGGG personal fork — V1 and automatic-continuation update
 
-Current version: **0.19.0-ahggg.2**.
+Current version: **0.19.0-ahggg.3**.
+
+The automatic-continuation contract below remains in effect. See
+[hardening behavior](HARDENING.md) for .3 saved-result recovery and lifecycle changes.
 Based on upstream master e955e29c51b7a6cce37e1108cd2d6c57a77e151c.
 Requires Pi 0.87.1 or newer; development dependencies are pinned to 0.87.1.
 This is a Git-installed personal fork, not a published npm package.
@@ -9,7 +12,7 @@ This is a Git-installed personal fork, not a published npm package.
 
 For an existing Git installation:
 
-    pi update --extensions
+    pi update git:github.com/AHGGG/pi-subagents
 
 For a new installation, remove any upstream copy first, then install:
 
