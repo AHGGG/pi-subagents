@@ -6,14 +6,19 @@
 
 Remove any installed upstream copy first. See [fork installation and behavior](docs/FORK_V1.md).
 
-**Current version: 0.19.0-ahggg.2. Automatic wake-up is restored.**
+**Current version: 0.19.0-ahggg.3. Automatic wake-up remains enabled.**
 Completion notices are queued after the current tool batch for the next model
 request. An idle main agent wakes automatically; a completion arriving during
 a text-only final answer also requests continuation while Pi remains open.
 V1 reliability fixes remain: async join by default, unread-result retention,
 resumable IDs, shutdown cleanup, stale-run filtering and the idle-safe widget.
 
-Already installed? Run `pi update --extensions`, then restart Pi after any
+The .3 update adds exact-ID recovery of saved final results in the current session
+branch, consistent execution finalization, and safe worktree preservation on errors.
+It does not automatically restart an agent merely to read an old answer.
+See [hardening behavior and limits](docs/HARDENING.md).
+
+Already installed? Run `pi update git:github.com/AHGGG/pi-subagents`, then restart Pi after any
 running agents finish. Do not load the upstream package alongside this fork.
 
 Stopping the parent alone does not cancel detached children or prevent their

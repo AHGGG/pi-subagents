@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.19.0-ahggg.3 — 2026-09-30
+
+- Preserve worktrees and report recovery paths when Git status, staging, commit,
+  branch creation or removal fails. Never force-delete work after preservation fails.
+- Finalize spawn/resume executions before exposing or consuming final results;
+  use fresh run identities, promises and controllers; reject overlapping resumes.
+- Record accepted and finalized top-level executions in the existing parent session.
+  Recover exact-ID final results from the current branch after in-memory cleanup
+  or extension reload, without rerunning a child or accessing unrelated sessions.
+- Make completion-observer failures non-fatal to concurrency slots and queue progress.
+- Add real-Git fault tests, lifecycle/recovery regressions, and real-Pi tests with
+  two managed children completing during/after parent auto-compaction.
+- Keep automatic wake-up, async join default and earlier V1 reliability fixes.
+
 ## 0.19.0-ahggg.2 — 2026-09-29
 
 - Restore automatic parent continuation on background completion. Use explicit

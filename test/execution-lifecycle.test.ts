@@ -95,3 +95,22 @@ describe("pending stop protection", () => {
     expect(() => manager.spawn({} as any, { cwd: process.cwd() } as any, "general-purpose", "late", { description: "late" })).toThrow("disposed");
   });
 });
+
+
+describe("run-scoped cancellation", () => {
+  it("aborting an old caller signal cannot stop a later resume", async () => {
+    const manager = new AgentManager();
+    vi.mocked(runAgent).mockResolvedValue(result());
+    vi.mocked(resumeAgent).mockResolvedValue({ text: "FIRST-RESUME" });
+    const id = manager.spawn({} as any, { cwd: process.cwd() } as any, "general-purpose", "work", { description: "work", isBackground: true });
+    await manager.waitForResult(id);
+    const old = new AbortController(); await manager.resume(id, "first", old.signal);
+    const hold = gate<any>(); vi.mocked(resumeAgent).mockReturnValueOnce(hold.promise);
+    const next = manager.resume(id, "second"); await flush();
+    try {
+      old.abort();
+      expect(manager.getRecord(id)!.abortController!.signal.aborted).toBe(false);
+      expect(manager.getRecord(id)!.status).toBe("running");
+    } finally { hold.resolve({ text: "SECOND-RESUME" }); await next; await manager.dispose(); }
+  });
+});

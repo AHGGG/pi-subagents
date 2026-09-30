@@ -32,6 +32,7 @@ import { describeModel, type ModelRegistry, resolveModel } from "./model-resolve
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
+import { findSavedResult, formatSavedResult, RESULT_ENTRY, RUN_START_ENTRY, snapshotRun } from "./result-history.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
@@ -600,12 +601,7 @@ export default function (pi: ExtensionAPI) {
       pi.events.emit("subagents:completed", eventData);
     }
 
-    // Persist final record for cross-extension history reconstruction
-    pi.appendEntry("subagents:record", {
-      id: record.id, type: record.type, description: record.description,
-      status: record.status, result: record.result, error: record.error,
-      startedAt: record.startedAt, completedAt: record.completedAt,
-    });
+    // Final results are recorded by the manager run observer, before notifications.
 
     // Skip notification if result was already consumed via get_subagent_result
     if (record.resultConsumed) {
@@ -770,6 +766,17 @@ export default function (pi: ExtensionAPI) {
 
   // --- Cross-extension RPC via pi.events ---
   let currentCtx: ExtensionContext | undefined;
+  manager.setRunObserver(record => {
+    if (shuttingDown || !currentCtx || !isTopLevelAgent(record)) return;
+    const sessionId = currentCtx.sessionManager.getSessionId();
+    if (record.rootSessionId !== undefined && record.rootSessionId !== sessionId) {
+      console.warn("[pi-subagents] Refusing to record an execution in a different parent session: " + record.id);
+      return;
+    }
+    // Run starts are recorded at acceptance, including queued resumes. A newer
+    // unfinished run therefore blocks recovery of a previous run's answer.
+    pi.appendEntry(record.runSettled ? RESULT_ENTRY : RUN_START_ENTRY, snapshotRun(record, sessionId));
+  });
   // RPC handlers + the `subagents:ready` broadcast are wired on `session_start`
   // (a bound lifecycle event), not at factory time. pi runs every extension
   // factory before the `extensions:` filter and only fires lifecycle events for
@@ -2784,7 +2791,7 @@ Background completion notices reach your next model request after the current to
     name: SUBAGENT_TOOL_NAMES.GET_RESULT,
     label: "Get Agent Result",
     description:
-      "Check status and retrieve a background agent's full result — its completion notification carries only a preview. Use the agent ID returned by Agent.",
+      "Check status and retrieve a background agent's full result — its completion notification carries only a preview. Use the exact agent ID returned by Agent. If its live record was cleaned up, a saved final result can be recovered from this session branch.",
     promptSnippet: "Check status and retrieve results from a background agent",
     parameters: Type.Object({
       agent_id: Type.String({
@@ -2803,8 +2810,22 @@ Background completion notices reach your next model request after the current to
     }),
     execute: async (_toolCallId, params, signal, _onUpdate, _ctx) => {
       const record = resolveAgentRef(params.agent_id);
-      if (!record || !isTopLevelAgent(record)) {
-        return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
+      if (record && !isTopLevelAgent(record)) {
+        return textResult(`Agent not found or not accessible: "` + params.agent_id + `". Use the owning agent or workflow to access its result.`);
+      }
+      if (!record) {
+        const history = findSavedResult(_ctx.sessionManager?.getBranch?.() ?? [], params.agent_id, _ctx.sessionManager?.getSessionId?.() ?? "");
+        if (history.kind === "found") {
+          return {
+            content: [{ type: "text" as const, text: formatSavedResult(history.result, !!params.verbose) }],
+            details: { source: "session-history", agentId: history.result.id, runId: history.result.runId, status: history.result.status },
+          };
+        }
+        if (history.kind === "unfinished") {
+          return textResult("No finalized result is recorded for the latest execution of " + params.agent_id + ". Its live record is unavailable; an older answer will not be substituted.");
+        }
+        return textResult("Agent not found: " + JSON.stringify(params.agent_id) +
+          (history.kind === "invalid" ? ". The saved record failed validation or scope checks." : ". No live record or saved result exists for this exact ID in the current session branch. Check the original launch/completion ID."));
       }
 
       // Waiting includes startup and finalization, not just model generation.
@@ -2877,7 +2898,7 @@ Background completion notices reach your next model request after the current to
     execute: async (_toolCallId, params, _signal, _onUpdate, _ctx) => {
       const record = resolveAgentRef(params.agent_id);
       if (!record || !isTopLevelAgent(record)) {
-        return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
+        return textResult(`Agent not found or not accessible: "${params.agent_id}". Steering requires a live agent owned by this session.`);
       }
       if (record.status !== "running") {
         return textResult(`Agent "${params.agent_id}" is not running (status: ${record.status}). Cannot steer a non-running agent.`);
