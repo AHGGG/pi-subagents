@@ -53,12 +53,14 @@ export function isWorktreeIsolationEnabled(): boolean {
 }
 
 export interface WorktreeCleanupResult {
-  /** Whether changes were found in the worktree. */
+  /** Changes were found, or could not safely be ruled out after a failure. */
   hasChanges: boolean;
   /** Branch name if changes were committed. */
   branch?: string;
   /** Worktree path if it was kept. */
   path?: string;
+  /** Preservation or removal failed; never interpret this as a clean tree. */
+  error?: string;
 }
 
 /**
@@ -129,9 +131,10 @@ export async function cleanupWorktree(
   agentDescription: string,
 ): Promise<WorktreeCleanupResult> {
   if (!existsSync(worktree.path)) {
-    return { hasChanges: false };
+    return { hasChanges: true, error: "Worktree is missing; its changes could not be verified." };
   }
 
+  let preservedBranch: string | undefined;
   try {
     // Check for uncommitted changes in the worktree
     const status = await git(pi, worktree.path, ["status", "--porcelain"], 10000);
@@ -165,6 +168,7 @@ export async function cleanupWorktree(
     }
     // Update branch name in worktree info for the caller
     worktree.branch = branchName;
+    preservedBranch = branchName;
 
     // Remove the worktree (branch persists in main repo)
     await removeWorktree(pi, cwd, worktree.path);
@@ -172,12 +176,17 @@ export async function cleanupWorktree(
     return {
       hasChanges: true,
       branch: worktree.branch,
-      path: worktree.path,
     };
-  } catch {
-    // Best effort cleanup on error
-    try { await removeWorktree(pi, cwd, worktree.path); } catch { /* ignore */ }
-    return { hasChanges: false };
+  } catch (err) {
+    // A failed status/stage/commit/branch operation may leave the only copy of
+    // the work here. Never remove it on the failure path. If only removal
+    // failed, preserve the already-created branch information as well.
+    return {
+      hasChanges: true,
+      ...(preservedBranch ? { branch: preservedBranch } : {}),
+      ...(existsSync(worktree.path) ? { path: worktree.path } : {}),
+      error: err instanceof Error ? err.message : String(err),
+    };
   }
 }
 
@@ -185,14 +194,9 @@ export async function cleanupWorktree(
  * Force-remove a worktree.
  */
 async function removeWorktree(pi: ExtensionAPI, cwd: string, worktreePath: string): Promise<void> {
-  try {
-    await git(pi, cwd, ["worktree", "remove", "--force", worktreePath], 10000);
-  } catch {
-    // If git worktree remove fails, try pruning
-    try {
-      await git(pi, cwd, ["worktree", "prune"], 5000);
-    } catch { /* ignore */ }
-  }
+  // Pruning registrations is not a substitute for removing a directory. Let
+  // cleanupWorktree report a failed removal rather than claim success.
+  await git(pi, cwd, ["worktree", "remove", "--force", worktreePath], 10000);
 }
 
 /**
