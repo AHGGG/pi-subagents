@@ -48,6 +48,8 @@ try { const report = JSON.parse(audit.stdout); console.log('DEPENDENCY_AUDIT', J
 
 // Worktree-result plumbing is centralized in the following lifecycle change.
 await apply('worktree', { replace: (path, ...args) => path === 'src/agent-manager.ts' ? undefined : replace(path, ...args) });
+replace('src/types.ts', 'import type { LifetimeUsage } from "./usage.js";', 'import type { LifetimeUsage } from "./usage.js";\nimport type { WorktreeCleanupResult } from "./worktree.js";');
+replace('src/types.ts', '  worktreeResult?: { hasChanges: boolean; branch?: string };', '  worktreeResult?: WorktreeCleanupResult;');
 commit('fix: preserve worktree changes when Git preservation or removal fails');
 await apply('lifecycle');
 replace('src/index.ts', 'import { abortable } from "./abortable.js";\n', '');
@@ -56,6 +58,7 @@ replace('src/agent-manager.ts', '            record.result += "\\n\\nChanges sav
 commit('fix: unify execution finalization, resume guards and result waiting');
 await apply('history');
 await apply('compaction');
+await apply('followup');
 await apply('docs');
 commit('feat: recover saved results across compaction and runtime cleanup (0.19.0-ahggg.3)');
 
