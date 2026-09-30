@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { cpSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -30,8 +30,8 @@ async function apply(name, overrides = {}) {
   module.default({ read, put, replace, section, ...overrides });
 }
 function commit(message) {
-  // Format only touched TypeScript files, not the entire inherited source tree.
-  const paths = git('status', '--porcelain').split('\n').map(l => l.slice(3)).filter(p => /^(src|test)\/.+\.ts$/.test(p));
+  const status = execFileSync('git', ['status', '--porcelain'], { encoding: 'utf8' });
+  const paths = status.split('\n').map(l => l.slice(3)).filter(p => /^(src|test)\/.+\.ts$/.test(p));
   if (paths.length) run('npx', ['biome', 'check', '--write', ...paths]);
   run('git', ['add', 'src', 'test', 'docs', 'README.md', 'CHANGELOG.md', 'package.json', 'package-lock.json', 'examples']);
   run('git', ['commit', '-m', message]);
@@ -43,12 +43,16 @@ run('git', ['checkout', '-b', BRANCH, BASE]);
 run('git', ['config', 'user.name', 'github-actions[bot]']);
 run('git', ['config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com']);
 run('npm', ['ci']);
+const audit = spawnSync('npm', ['audit', '--json'], { encoding: 'utf8' });
+try { const report = JSON.parse(audit.stdout); console.log('DEPENDENCY_AUDIT', JSON.stringify({ metadata: report.metadata, vulnerabilities: report.vulnerabilities })); } catch { console.log('DEPENDENCY_AUDIT_UNAVAILABLE'); }
 
 // Worktree-result plumbing is centralized in the following lifecycle change.
 await apply('worktree', { replace: (path, ...args) => path === 'src/agent-manager.ts' ? undefined : replace(path, ...args) });
 commit('fix: preserve worktree changes when Git preservation or removal fails');
 await apply('lifecycle');
+replace('src/index.ts', 'import { abortable } from "./abortable.js";\n', '');
 replace('src/agent-manager.ts', '    signal.addEventListener("abort", () => this.abort(id), { once: true });', '    const runId = this.agents.get(id)?.runId;\n    signal.addEventListener("abort", () => {\n      if (this.agents.get(id)?.runId === runId) this.abort(id);\n    }, { once: true });');
+replace('src/agent-manager.ts', '            record.result += "\\n\\nChanges saved to branch " + wt.branch + repoNote + ". Merge with: git merge " + wt.branch;', '            record.result += "\\n\\n---\\nChanges saved to branch `" + wt.branch + "`" + repoNote + ". Merge with: `git merge " + wt.branch + "`" +\n              (customCwd !== undefined ? " (run in `" + baseCwd + "`)" : "");');
 commit('fix: unify execution finalization, resume guards and result waiting');
 await apply('history');
 await apply('compaction');
