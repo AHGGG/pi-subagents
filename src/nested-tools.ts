@@ -134,6 +134,9 @@ type ResultPosition = "inline" | "fetched";
 function formatRecord(record: AgentRecord, position: ResultPosition): string {
   // Matches the top-level format so one `Agent ID: (\S+)` reads either surface.
   const idLine = position === "inline" ? `Agent ID: ${record.id}` : "";
+  if (record.runSettled === false && record.status !== "running" && record.status !== "queued") {
+    return `Agent ${record.id} is stopping or finalizing. Use wait: true for its final result.`;
+  }
   if (record.status === "error") {
     const failure = [`Agent failed: ${record.error ?? "unknown error"}`, idLine].filter(Boolean).join("\n");
     return `${failure}${partialOutputSuffix(record)}`;
@@ -389,10 +392,11 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       // call is aborted) stops only this wait; the nested child keeps running and
       // stays unconsumed. Queued records have no promise until the manager starts
       // them, so poll — abortably — until they leave the queue, then await.
-      if (params.wait && (record.status === "queued" || record.status === "running")) {
+      if (params.wait && (record.runSettled === false || record.status === "queued" || record.status === "running")) {
         while (record.status === "queued") {
           await abortable(new Promise<void>(resolve => setTimeout(resolve, 250)), signal);
         }
+        await abortable(context.manager.awaitStartup(record.id), signal);
         if (record.promise) await abortable(record.promise, signal);
       }
       return textResult(formatRecord(record, "fetched"), record.status === "error");

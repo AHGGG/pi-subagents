@@ -155,6 +155,10 @@ export type MentionResolution =
   | { kind: "tombstone"; entry: AgentTombstone };
 
 export interface AgentRecord {
+  /** Identity of the current execution; an agent ID can be resumed repeatedly. */
+  runId?: string;
+  /** False until execution and required finalization have both finished. */
+  runSettled?: boolean;
   id: string;
   type: SubagentType;
   /**

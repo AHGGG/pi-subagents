@@ -90,8 +90,8 @@ function childCwd(record: AgentRecord): string | undefined {
 
 /**
  * Whether the child itself succeeded — the same condition {@link toSpawnResult}
- * turns into `ok`, read from the live record so the pre-cleanup hook can tell a
- * finished child from a failed one before the result exists.
+ * turns into `ok`. The pre-cleanup hook receives the model outcome separately
+ * because the record remains pending until preservation has finished.
  */
 function succeeded(record: AgentRecord | undefined): boolean {
   return record?.status === "completed" || record?.status === "steered";
@@ -279,10 +279,10 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       const onBeforeWorktreeCleanup =
         command === undefined
           ? undefined
-          : async (worktreePath: string): Promise<void> => {
+          : async (worktreePath: string, outcome: AgentRecord["status"]): Promise<void> => {
               // A failed child's gate is never consulted — the runtime reports
               // the child's own failure — so running it would be pure cost.
-              if (spawnedId === undefined || !succeeded(manager.getRecord(spawnedId))) return;
+              if (spawnedId === undefined || (outcome !== "completed" && outcome !== "steered")) return;
               try {
                 gate = await executeGate(command, worktreePath);
               } catch (error) {
