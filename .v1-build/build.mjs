@@ -64,6 +64,7 @@ replace('src/agent-manager.ts', '    signal.addEventListener("abort", () => this
 replace('src/agent-manager.ts', '            record.result += "\\n\\nChanges saved to branch " + wt.branch + repoNote + ". Merge with: git merge " + wt.branch;', '            record.result += "\\n\\n---\\nChanges saved to branch `" + wt.branch + "`" + repoNote + ". Merge with: `git merge " + wt.branch + "`" +\n              (customCwd !== undefined ? " (run in `" + baseCwd + "`)" : "");');
 replace('test/agent-manager.test.ts', '// Foreground resume returns its result inline and never notified (historical).', '// Foreground resume returns its result inline and never notified before.');
 await apply('integration-fixes');
+await apply('readiness');
 commit('fix: unify execution finalization, resume guards and result waiting');
 await apply('history');
 await apply('compaction');
@@ -71,7 +72,7 @@ await apply('followup');
 await apply('docs');
 commit('feat: recover saved results across compaction and runtime cleanup (0.19.0-ahggg.3)');
 
-run('npx', ['vitest', 'run', 'test/worktree-preservation.test.ts', 'test/worktree.test.ts', 'test/execution-lifecycle.test.ts', 'test/agent-manager.test.ts', 'test/workflow-gate-worktree.test.ts', 'test/background-resume-wiring.test.ts', 'test/result-history.test.ts', 'test/result-recovery-wiring.test.ts', 'test/e2e/result-compaction.e2e.test.ts']);
+run('npx', ['vitest', 'run', 'test/worktree-preservation.test.ts', 'test/worktree.test.ts', 'test/execution-lifecycle.test.ts', 'test/agent-manager.test.ts', 'test/workflow-gate-worktree.test.ts', 'test/background-resume-wiring.test.ts', 'test/nested-tools.test.ts', 'test/result-history.test.ts', 'test/result-recovery-wiring.test.ts', 'test/e2e/result-compaction.e2e.test.ts']);
 run('npm', ['run', 'check']);
 run('npm', ['run', 'build']);
 run('npm', ['run', 'test:e2e']);
