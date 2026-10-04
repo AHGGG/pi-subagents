@@ -368,11 +368,14 @@ export function resolveDefaultModel(
 ): Model<any> | undefined {
   if (configModel) {
     const slashIdx = configModel.indexOf("/");
-    if (slashIdx !== -1) {
-      const provider = configModel.slice(0, slashIdx);
-      const modelId = configModel.slice(slashIdx + 1);
+    // Explicit provider/model means exactly that provider. A bare model is a
+    // same-provider override: try it on the parent provider and never hop to a
+    // different authenticated provider behind the user's back.
+    const provider = slashIdx !== -1 ? configModel.slice(0, slashIdx) : parentModel?.provider;
+    const modelId = slashIdx !== -1 ? configModel.slice(slashIdx + 1) : configModel;
 
-      // Build a set of available model keys for fast lookup
+    if (provider) {
+      // Build a set of available model keys for fast lookup.
       const available = registry.getAvailable?.();
       const availableKeys = available
         ? new Set(available.map((m: any) => `${m.provider}/${m.id}`))

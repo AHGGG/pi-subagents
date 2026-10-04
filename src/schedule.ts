@@ -234,7 +234,7 @@ export class SubagentScheduler {
     // if resolution fails; the spawn path handles undefined model gracefully.
     let resolvedModel: any | undefined;
     if (job.model) {
-      const r = resolveModel(job.model, ctx.modelRegistry);
+      const r = resolveModel(job.model, ctx.modelRegistry, ctx.model?.provider);
       if (typeof r !== "string") resolvedModel = r;
     }
 

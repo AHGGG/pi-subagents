@@ -1655,7 +1655,7 @@ Background completion notices reach your next model request after the current to
       model: Type.Optional(
         Type.String({
           description:
-            'Optional model override. Accepts "provider/modelId" or fuzzy name (e.g. "haiku", "sonnet"). Omit to use the agent type\'s default.',
+            'Optional model override. Bare model IDs/names stay on the current provider; use "provider/modelId" only to switch providers explicitly. Omit to use the agent type\'s default.',
         }),
       ),
       thinking: Type.Optional(
@@ -1857,7 +1857,7 @@ Background completion notices reach your next model request after the current to
       // Resolve model from agent config first; tool-call params only fill gaps.
       let model = ctx.model;
       if (resolvedConfig.modelInput) {
-        const resolved = resolveModel(resolvedConfig.modelInput, ctx.modelRegistry);
+        const resolved = resolveModel(resolvedConfig.modelInput, ctx.modelRegistry, ctx.model?.provider);
         if (typeof resolved === "string") {
           if (resolvedConfig.modelFromParams) return textResult(resolved);
           // config-specified: silent fallback to parent
@@ -1910,7 +1910,7 @@ Background completion notices reach your next model request after the current to
       // resolves to nothing is still worth disclosing: it cannot have taken effect.
       const askedModel = ((asked: string | undefined) => {
         if (!asked) return undefined;
-        const resolvedAsked = resolveModel(asked, ctx.modelRegistry);
+        const resolvedAsked = resolveModel(asked, ctx.modelRegistry, ctx.model?.provider);
         if (typeof resolvedAsked === "string") return asked;
         return resolvedAsked.provider === model?.provider && resolvedAsked.id === model?.id ? undefined : asked;
       })(resolvedConfig.overridden?.model);
@@ -2941,17 +2941,17 @@ Background completion notices reach your next model request after the current to
   // so they are reachable from tests — this command handler is only registered
   // through `registerCommand`, which every test mocks.
 
-  function getModelLabel(type: string, registry?: ModelRegistry): string {
+  function getModelLabel(type: string, registry?: ModelRegistry, preferredProvider?: string): string {
     const cfg = getAgentConfig(type);
     if (!cfg?.model) return "inherit"; // no model configured → really inherits parent
     const label = getModelLabelFromConfig(cfg.model);
     if (!registry) return label;
-    const resolved = resolveModel(cfg.model, registry);
+    const resolved = resolveModel(cfg.model, registry, preferredProvider);
     // Configured but unresolvable: the runtime silently falls back to the parent
     // model, so flag it (and the fallback) rather than hiding the config.
     if (typeof resolved === "string") return `${label} (unavailable, fallback: inherit)`;
     // Surface what it actually resolved to when that differs from the config —
-    // e.g. a provider fallback or a looser version pin. Cosmetic separator/date
+    // e.g. a looser version pin. Cosmetic separator/date
     // differences are normalized away so an effectively-identical match stays quiet.
     const resolvedFull = `${resolved.provider}/${resolved.id}`;
     const norm = (s: string) => s.toLowerCase().replace(/\./g, "-").replace(/-\d{8}$/, "");
@@ -3051,7 +3051,7 @@ Background completion notices reach your next model request after the current to
     const items: SettingItem[] = allNames.map(name => {
       const cfg = getAgentConfig(name);
       const disabled = cfg?.enabled === false;
-      const model = getModelLabel(name, ctx.modelRegistry);
+      const model = getModelLabel(name, ctx.modelRegistry, ctx.model?.provider);
       return {
         id: name,
         label: `${sourceIndicator(cfg)}${name}`,
@@ -3351,7 +3351,7 @@ The file format is a markdown file with YAML frontmatter and a system prompt bod
 description: <one-line description shown in UI>
 color: <optional agent name badge color: red, blue, green, yellow, purple, orange, pink, cyan, an Agency Agents alias, or quoted "#RRGGBB">
 tools: <comma-separated built-in tools: read, bash, edit, write, grep, find, ls. Use "none" for no tools. Omit for all tools>
-model: <optional model as "provider/modelId", e.g. "anthropic/claude-haiku-4-5". Omit to inherit parent model>
+model: <optional model ID/name. Bare values stay on the parent provider; "provider/modelId" switches providers explicitly. Omit to inherit parent model>
 thinking: <optional thinking level: ${THINKING_LEVELS.join(", ")}. Omit to inherit>
 max_turns: <optional max agentic turns. 0 or omit for unlimited (default)>
 prompt_mode: <"replace" (body IS the full system prompt) or "append" (body is appended to default prompt). Default: replace>
@@ -3454,7 +3454,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
     else if (modelChoice === "sonnet") model = "anthropic/claude-sonnet-4-6";
     else if (modelChoice === "opus") model = "anthropic/claude-opus-4-6";
     else if (modelChoice === "custom...") {
-      model = (await ctx.ui.input("Model (provider/modelId)")) || undefined;
+      model = (await ctx.ui.input("Model (bare stays on parent provider; provider/modelId switches)")) || undefined;
     }
 
     // 5. Thinking

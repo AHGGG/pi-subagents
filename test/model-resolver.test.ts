@@ -125,20 +125,30 @@ describe("resolveModel", () => {
     });
   });
 
-  describe("provider fallback (prefer named provider, else any)", () => {
+  describe("provider scoping", () => {
     const gatewayHaiku = { id: "claude-haiku-4-5", name: "Claude Haiku", provider: "openrouter" };
     const anthropicHaiku = { id: "claude-haiku-4-5", name: "Claude Haiku", provider: "anthropic" };
 
-    it("falls back to another provider when the named one lacks the model", () => {
-      expect(resolveModel("anthropic/claude-haiku-4-5", makeRegistry([gatewayHaiku]))).toEqual(gatewayHaiku);
+    it("does not cross providers for an explicit provider/model", () => {
+      const result = resolveModel("anthropic/claude-haiku-4-5", makeRegistry([gatewayHaiku]));
+      expect(typeof result).toBe("string");
+      expect(result).toContain('in provider "anthropic"');
     });
 
-    it("prefers the named provider when it has the model", () => {
+    it("uses the named provider when it has the model", () => {
       expect(resolveModel("anthropic/claude-haiku-4-5", makeRegistry([gatewayHaiku, anthropicHaiku]))).toEqual(anthropicHaiku);
     });
 
-    it("still errors when no provider has the model", () => {
-      expect(typeof resolveModel("anthropic/nonexistent-xyz", makeRegistry([gatewayHaiku]))).toBe("string");
+    it("resolves a bare model only inside the preferred parent provider", () => {
+      expect(resolveModel("claude-haiku-4-5", makeRegistry([gatewayHaiku, anthropicHaiku]), "openrouter"))
+        .toEqual(gatewayHaiku);
+    });
+
+    it("does not use another provider when a bare model is missing from the parent provider", () => {
+      const result = resolveModel("claude-haiku-4-5", makeRegistry([gatewayHaiku]), "anthropic");
+      expect(typeof result).toBe("string");
+      expect(result).toContain('in provider "anthropic"');
+      expect(result).not.toContain("openrouter/claude-haiku-4-5");
     });
   });
 

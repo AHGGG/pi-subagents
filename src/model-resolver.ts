@@ -40,25 +40,37 @@ export function describeModel(
 export function resolveModel(
   input: string,
   registry: ModelRegistry,
+  preferredProvider?: string,
 ): any | string {
   // Available models (those with auth configured)
-  const all = (registry.getAvailable?.() ?? registry.getAll()) as ModelEntry[];
-  const availableSet = new Set(all.map(m => `${m.provider}/${m.id}`.toLowerCase()));
+  const available = (registry.getAvailable?.() ?? registry.getAll()) as ModelEntry[];
 
-  // 1. Exact match: "provider/modelId" — only if available (has auth)
+  // A provider/model input is an explicit provider choice. A bare model stays
+  // on the caller's provider when one is supplied. This prevents an innocent
+  // model override from silently moving work (and billing) to another provider.
   const slashIdx = input.indexOf("/");
+  const explicitProvider = slashIdx !== -1 ? input.slice(0, slashIdx) : undefined;
+  const providerScope = explicitProvider ?? preferredProvider;
+  const all = providerScope
+    ? available.filter(m => m.provider.toLowerCase() === providerScope.toLowerCase())
+    : available;
+
+  // 1. Exact canonical match for explicit provider/model inputs.
   if (slashIdx !== -1) {
-    const provider = input.slice(0, slashIdx);
     const modelId = input.slice(slashIdx + 1);
-    if (availableSet.has(input.toLowerCase())) {
-      const found = registry.find(provider, modelId);
+    const exact = all.find(
+      m => m.provider.toLowerCase() === explicitProvider!.toLowerCase()
+        && m.id.toLowerCase() === modelId.toLowerCase(),
+    );
+    if (exact) {
+      const found = registry.find(exact.provider, exact.id);
       if (found) return found;
     }
   }
 
-  // 2. Fuzzy match against available models. Normalize separators so cosmetic
-  // punctuation differences still match — e.g. "claude-haiku-4.5" and
-  // "claude-haiku-4-5" (dot vs dash in the version) resolve to the same model.
+  // 2. Fuzzy match, but only inside the provider scope established above.
+  // Normalize separators so cosmetic punctuation differences still match —
+  // e.g. "claude-haiku-4.5" and "claude-haiku-4-5".
   const normalize = (s: string) => s.toLowerCase().replace(/\./g, "-");
   const query = normalize(input);
 
@@ -100,19 +112,13 @@ export function resolveModel(
     if (found) return found;
   }
 
-  // 3. Provider fallback: a "provider/modelId" query that didn't match under the
-  // named provider (exact or fuzzy above) retries against all providers. The
-  // named provider is preferred when present; this only kicks in when it isn't,
-  // so the same model from another provider beats falling back to "inherit".
-  if (slashIdx !== -1) {
-    const bare = resolveModel(input.slice(slashIdx + 1), registry);
-    if (typeof bare !== "string") return bare;
-  }
-
-  // 4. No match — list available models
+  // 3. No match. Do not cross providers: callers that supplied a parent
+  // provider will fall back to the parent model; explicit provider/model inputs
+  // fail against that provider rather than being silently rerouted.
   const modelList = all
     .map(m => `  ${m.provider}/${m.id}`)
     .sort()
     .join("\n");
-  return `Model not found: "${input}".\n\nAvailable models:\n${modelList}`;
+  const scope = providerScope ? ` in provider "${providerScope}"` : "";
+  return `Model not found: "${input}"${scope}.\n\nAvailable models:\n${modelList || "  (none)"}`;
 }

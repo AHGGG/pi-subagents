@@ -2720,10 +2720,18 @@ describe("resolveDefaultModel", () => {
     expect(resolveDefaultModel(parent, r as any, "anthropic/nope")).toBe(parent);
   });
 
-  it("falls back to the parent for a model string with no provider prefix", () => {
+  it("resolves a bare model id against the parent provider", () => {
     const r = registry([haiku]);
-    expect(resolveDefaultModel(parent, r, "haiku")).toBe(parent);
-    expect(r.find).not.toHaveBeenCalled();
+    expect(resolveDefaultModel(parent, r, "claude-haiku-4-5"))
+      .toEqual({ provider: "anthropic", id: "claude-haiku-4-5" });
+    expect(r.find).toHaveBeenCalledWith("anthropic", "claude-haiku-4-5");
+  });
+
+  it("does not switch providers for a bare model id", () => {
+    const otherProvider = { provider: "openai", id: "gpt-6.1-sol" } as any;
+    const r = registry([otherProvider]);
+    expect(resolveDefaultModel(parent, r, "gpt-6.1-sol")).toBe(parent);
+    expect(r.find).toHaveBeenCalledWith("anthropic", "gpt-6.1-sol");
   });
 
   it("returns the parent model when no model is configured", () => {

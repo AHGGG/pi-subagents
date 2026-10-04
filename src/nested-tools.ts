@@ -180,7 +180,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       prompt: Type.String({ description: "Self-contained task for the nested agent." }),
       description: Type.String({ description: "Short 3-5 word task description." }),
       subagent_type: Type.String({ description: `Allowed nested agent type. Available: ${availableIn(loadRegistry()).join(", ") || "none"}.` }),
-      model: Type.Optional(Type.String({ description: "Optional provider/model override." })),
+      model: Type.Optional(Type.String({ description: "Optional model override. Bare values stay on this agent's provider; provider/model switches explicitly." })),
       thinking: Type.Optional(Type.String({ description: "Optional thinking level." })),
       max_turns: Type.Optional(Type.Number({ minimum: 1 })),
       run_in_background: Type.Optional(
@@ -243,7 +243,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       });
       let model = ctx.model;
       if (invocation.modelInput) {
-        const resolvedModel = resolveModel(invocation.modelInput, ctx.modelRegistry);
+        const resolvedModel = resolveModel(invocation.modelInput, ctx.modelRegistry, ctx.model?.provider);
         if (typeof resolvedModel === "string") {
           if (invocation.modelFromParams) return textResult(resolvedModel, true);
         } else {
