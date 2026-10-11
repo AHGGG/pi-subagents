@@ -1209,7 +1209,10 @@ export async function runAgent(
   const startLen = session.messages.length;
   let structuredRetried = false;
   try {
-    await session.prompt(effectivePrompt);
+    // A signal that fired before this point never calls the listener above, and
+    // pi's `session.abort()` is a no-op until a run is active — so a child whose
+    // parent is already gone is not prompted at all.
+    if (options.signal?.aborted !== true) await session.prompt(effectivePrompt);
 
     // One more prompt when a schema was asked for and nothing usable came back
     // — the model answered in prose, or only ever called the tool invalidly.
@@ -1288,7 +1291,8 @@ export async function resumeAgent(
     : () => {};
 
   try {
-    await session.prompt(prompt);
+    // Already aborted: not prompted, as in `runAgent`.
+    if (options.signal?.aborted !== true) await session.prompt(prompt);
   } finally {
     collector.unsubscribe();
     unsubEvents();
