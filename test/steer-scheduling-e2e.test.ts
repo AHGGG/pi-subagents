@@ -95,6 +95,9 @@ describe("background completion steering scheduling", () => {
     const runPromise = runPrintMode({
       cwd,
       hold: false,
+      // Pinned faux: the scheduling assertions count scripted model calls, so the
+      // pre-publish smoke's global `PI_E2E_LIVE=1` must not swap a real model in.
+      live: false,
       extensionPaths: [BLOCKING_TOOL_EXTENSION],
       prompt: "Start a background child and keep working with a blocking tool.",
       onParentSession: (session) => {

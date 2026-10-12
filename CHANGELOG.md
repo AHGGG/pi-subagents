@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-10-12
+
+> **⚠️ Possibly breaking — four fixes below change what an existing setup does:**
+> - **An agent file with `isolation: worktree` now fails to start outside a git repo** on mention and RPC spawns, where it used to run in the main checkout.
+> - **An agent file's `isolated:` and `isolation:` now override the RPC caller.** A caller's `isolated: false` or `isolation: "worktree"` no longer wins over the file.
+> - **Every subagent with `extensions: true` starts its own `mcp.json` servers.** To keep the old behavior, add `exclude_extensions: builtin:mcp` to the agent, put `-builtin:mcp` in pi's `extensions` setting, or start pi with `--no-mcp`.
+> - **Subagents in an untrusted project no longer load its `.pi` extensions or settings.**
+
 ### Added
 - **Fullscreen conversation observer** ([#357](https://github.com/tintinweb/pi-subagents/pull/357) — thanks [@sadiksaifi](https://github.com/sadiksaifi)). In pi's fullscreen mode, the default, an agent opened from FleetView, `/agents` or the workflow inspector now fills the terminal with mouse-wheel scrolling, a draggable scrollbar that follows pi's `fullscreenScrollbar` setting, clickable footer controls, and a `Ctrl+End` jump-to-latest marker that counts new messages. Regular mode keeps the floating viewer.
 - **`ctrl+b` sends a running foreground `Agent` call to the background, as in Claude Code** ([#261](https://github.com/tintinweb/pi-subagents/pull/261), supersedes [#233](https://github.com/tintinweb/pi-subagents/pull/233) — thanks [@titouanmathis](https://github.com/titouanmathis)). The run keeps going, the blocked call returns as a `run_in_background` spawn would, and completion arrives as the normal background notification. `ctrl+b` hands off every running foreground call while the prompt editor has focus; `b` in the conversation viewer hands off one. Also fixed: a child whose parent was interrupted before it started is no longer prompted. See [Sending a foreground agent to the background](README.md#sending-a-foreground-agent-to-the-background).
