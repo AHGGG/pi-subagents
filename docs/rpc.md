@@ -18,17 +18,17 @@ For the channel list, the reply envelope, the per-channel snippets and the event
 | `name` | string | A memorable second handle (`@auth-audit`). Slugged, never validated — anything unusable degrades rather than failing the spawn |
 | `model` | `Model` **or** model string | Strings are resolved at the RPC boundary against `ctx.modelRegistry`. Bare IDs/names stay on the current parent provider; `"provider/modelId"` switches providers explicitly. `null` means inherit, not override. See [Model Scope](../README.md#model-scope) |
 | `maxTurns` | number | Turn ceiling for the run |
-| `isolated` | boolean | Strips extensions, skills and nested tools. **Not** a git worktree — see the trap table below |
-| `inheritContext` | boolean | Fork the parent conversation into the child |
+| `isolated` | boolean | Strips extensions, skills and nested tools. Applies only when the agent file leaves `isolated:` unset — frontmatter is authoritative. **Not** a git worktree — see the trap table below |
+| `inheritContext` | boolean | Fork the parent conversation into the child. Only this option decides — an agent file's `inherit_context:` does not apply to RPC spawns |
 | `thinkingLevel` | ThinkingLevel | Clamped to what the resolved model supports |
 | `isBackground` | boolean | Occupies a `maxConcurrent` slot and queues behind them. Every RPC spawn runs detached regardless; this is what decides whether it is *pooled* |
 | `bypassQueue` | boolean | Starts immediately even when the concurrency limit would queue it. The slot is still counted once running |
 | `structuredOutput` | CompiledSchema | Makes the child report through a `StructuredOutput` tool |
-| `isolation` | `"worktree"` | Temp git worktree, committed to a `pi-agent-*` branch on completion |
-| `cwd` | absolute path | The agent's tools operate here; `.pi` config still loads from the parent session's project |
+| `isolation` | `"off"` or `"worktree"` | Temp git worktree, committed to a `pi-agent-*` branch on completion. The agent file's `isolation:` wins: `worktree` applies even when this is omitted, and `off` refuses it. Preservation failures keep the worktree and report its path |
+| `cwd` | absolute path | The agent's tools operate here; `.pi` config still loads from the parent session's project, and the child reports this directory as untrusted (`ctx.isProjectTrusted()` is `false`) |
 | `invocation` | AgentInvocation | Resolved snapshot used for UI display |
 | `signal` | AbortSignal | Aborting it stops the subagent |
-| `onSpawned` / `onQueued` / `onCompaction` / `onBeforeWorktreeCleanup` | functions | Fire as documented on `SpawnOptions` |
+| `onSpawned` / `onQueued` / `onCompaction` / `onBeforeWorktreeCleanup` | functions | Fire as documented on `SpawnOptions`. The cleanup hook receives `(worktreePath, outcome)` while required preservation is still pending |
 
 **Silently stripped** — set these and nothing happens, with no error and no note. Each deletion is a deliberate guard, and the reasons are worth knowing because they say what the surface refuses to let a caller forge:
 
@@ -121,13 +121,13 @@ When a background agent finishes, pi-subagents sends the user a completion notif
 |---|---|
 | Synchronously, inside your `subagents:completed` handler | The notification is never scheduled. This is the clean path |
 | After an `await`, within 200 ms | Still suppressed. The nudge is held for `NUDGE_HOLD_MS` (`src/index.ts:451`), `consume` cancels the pending timer (`:819`), and there is a re-check at send time (`:474`) |
-| After 200 ms | Too late. The follow-up has fired with `triggerTurn: true` and cost the parent a turn |
+| After 200 ms | Too late. The notification has been queued with `triggerTurn: true` and costs the parent a model call |
 
 Fire-and-forget is the intended use: the reply carries nothing to act on, and the channel sits outside the `subagents:rpc:ping` version handshake on purpose (`src/cross-extension-rpc.ts:190`), so you can send it unconditionally and an older pi-subagents with no handler simply keeps notifying.
 
 Consumption is not terminal. An `@handle` steer un-consumes the record (`src/index.ts:920`) because the agent's reply to that message still needs relaying, and so does a background resume (`src/agent-manager.ts:1135`) because the record is starting a new run.
 
-One related thing that lives nowhere else: on every top-level settle, pi-subagents writes a session entry — not an event — via `pi.appendEntry("subagents:record", …)` (`src/index.ts:585`), carrying `id`, `type`, `description`, `status`, `result`, `error`, `startedAt` and `completedAt`. It exists for cross-extension history reconstruction. It is append-only history, not something to react to.
+The fork writes state-only session entries through its run observer: `subagents:run-start` when a top-level execution is accepted, and `subagents:record` when it is finalized. Both carry `version: 1`, `id`, `runId`, `rootSessionId`, `type`, `description`, `status` and timestamps; only finalized records carry `result` and `error`. These are append-only history, separate from lifecycle events and completion messages. They let `get_subagent_result` recover an exact-ID result from the current session branch after runtime cleanup, while a newer unfinished execution prevents an older answer being returned as current. See [`HARDENING.md`](HARDENING.md#result-retrieval).
 
 ## The manager registry
 
@@ -135,7 +135,7 @@ One related thing that lives nowhere else: on every top-level settle, pi-subagen
 
 | Member | Signature | Notes |
 |---|---|---|
-| `waitForAll()` | `() => Promise<void>` | Resolves when nothing is running. **All** agents, including ones you did not spawn — a shutdown barrier, not a join |
+| `waitForAll()` | `() => Promise<void>` | Resolves after running, queued, stopping and finalizing executions unwind. **All** agents, including ones you did not spawn — a barrier, not an ownership-scoped join |
 | `hasRunning()` | `() => boolean` | |
 | `spawn(pi, ctx, type, prompt, options)` | `=> string` | **Is** `spawnTopLevel`, so the strip list above applies identically |
 | `getRecord(id)` | `=> AgentRecord \| undefined` | Filtered through `isTopLevelAgent`, so someone else's child comes back `undefined` rather than leaking |
@@ -160,7 +160,7 @@ So: send `consume` unconditionally and ignore the outcome — an older build has
 
 The consequence is worth stating plainly: **a session that excludes pi-subagents is indistinguishable from pi-subagents not being installed.** It emits no `subagents:ready` and answers nothing. Give discovery a timeout and treat expiry as "not available here" rather than waiting indefinitely. The payload is `{}` — read nothing off it. Handlers are torn down and the flag reset on `session_shutdown` (`src/index.ts:1100-1103`), so a later `session_start` re-registers and re-emits.
 
-One more trap on the way in: an RPC-spawned agent emits **no `subagents:created`**. The only two emit sites are the `Agent` tool's background branch (`src/index.ts:2104`) and detached resume (`:1350`). Your first event for your own agent is `subagents:started` (`:625`), so key your bookkeeping off the id that `spawn` handed you, not off `subagents:created`.
+One more trap on the way in: an RPC-spawned agent emits **no `subagents:created`**. The only three emit sites are the `Agent` tool's background branch (`src/index.ts:2222`), detached resume (`:1442`), and a foreground `Agent` call handed to the background with ctrl+b or the viewer's `b` (`:1165`) — that one fires after the agent's `subagents:started`, as resume does. Your first event for your own agent is `subagents:started` (`:629`), so key your bookkeeping off the id that `spawn` handed you, not off `subagents:created`.
 
 ## What the tests pin
 

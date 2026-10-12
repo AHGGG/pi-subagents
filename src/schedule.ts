@@ -12,7 +12,7 @@
  *     of dispatching a user message — schedule fires bypass maxConcurrent so
  *     a 5-minute interval can't be deferred behind 4 long-running agents.
  *   - Result delivery is implicit: spawn → background completion → existing
- *     `subagent-notification` followUp path. No new delivery code.
+ *     `subagent-notification` path. No new delivery code.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -229,17 +229,19 @@ export class SubagentScheduler {
 
     store.update(id, { lastStatus: "running" });
 
-    // Resolve model at fire time — registry contents may have changed since the
-    // job was created (auth added/removed). Fall back silently to spawn-default
-    // if resolution fails; the spawn path handles undefined model gracefully.
-    let resolvedModel: any | undefined;
-    if (job.model) {
-      const r = resolveModel(job.model, ctx.modelRegistry, ctx.model?.provider);
-      if (typeof r !== "string") resolvedModel = r;
-    }
-
     let agentId: string;
     try {
+      // Resolve at fire time: auth or the registry may have changed. A missing
+      // bare override inherits the parent; a missing explicit provider/model
+      // fails. Leaving either unset could reselect an agent file's other provider.
+      let resolvedModel: any | undefined;
+      if (job.model) {
+        const r = resolveModel(job.model, ctx.modelRegistry, ctx.model?.provider);
+        if (typeof r !== "string") resolvedModel = r;
+        else if (job.model.includes("/")) throw new Error(r);
+        else resolvedModel = ctx.model;
+      }
+
       // Re-resolve at fire time against the registry as it stands. This does not
       // reload from disk (the scheduler has no reason to rebuild process-global
       // state from a timer), so it catches changes that went through /agents or

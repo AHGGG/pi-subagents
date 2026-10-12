@@ -1,11 +1,13 @@
-# AHGGG personal fork — V1 and automatic-continuation update
+# AHGGG personal fork — installation and behavior
 
-Current version: **0.19.0-ahggg.3**.
+Current version: **0.20.0-ahggg.1**.
 
-The automatic-continuation contract below remains in effect. See
-[hardening behavior](HARDENING.md) for .3 saved-result recovery and lifecycle changes.
-Based on upstream master e955e29c51b7a6cce37e1108cd2d6c57a77e151c.
-Requires Pi 0.87.1 or newer; development dependencies are pinned to 0.87.1.
+Synced through upstream master `7d83085`, including changes after upstream 0.20.0.
+See [merge decisions](UPSTREAM_SYNC.md) for the imported changes and
+[hardening behavior](HARDENING.md) for retained saved-result recovery and lifecycle guarantees.
+Requires Pi **1.1.0 or newer**; development dependencies and the required CI baseline
+are pinned to 1.1.0. Host-provided runtime packages use `"*"` peers for Pi's loader
+contract, so the peer range does not enforce that minimum.
 This is a Git-installed personal fork, not a published npm package.
 
 ## Install or update
@@ -24,13 +26,16 @@ instead. Restart Pi after running agents finish, or use /reload when none remain
 The fork loads src/index.ts directly; no separate clone/build or npm publication
 is needed. Do not install the unpublished @ahggg/pi-subagents npm name.
 
-## Completion contract (updated in .2)
+## Completion contract
+
+Introduced in `0.19.0-ahggg.2` and retained in the current fork. Upstream #387 now
+uses the same delivery policy; the fork keeps one shared option constant.
 
 Individual, grouped and workflow-tool completions use the shared delivery options:
 
     { deliverAs: "steer", triggerTurn: true }
 
-On the tested Pi 0.87.1 runtime:
+On the supported Pi 1.1 runtime:
 
 - While the parent is working, the current model response and complete tool batch
   finish first. The completion is included before the next model request, not
@@ -44,7 +49,7 @@ On the tested Pi 0.87.1 runtime:
   nor creates a new user-authored message. The main model decides how to act on
   the notice; retrieval is not guaranteed solely by the delivery mechanism.
 
-This replaces .1's passive-only policy; all other V1 reliability fixes remain.
+This replaced `0.19.0-ahggg.1`'s passive-only policy; all other V1 reliability fixes remain.
 Automatic turns use the configured main model and can incur normal model costs.
 There is no busy/idle polling timer or agent-loop monkey-patch in this update.
 
@@ -59,7 +64,7 @@ A notice already handed to Pi cannot be retracted by the extension.
 Wake-up requires a live Pi session. It does not keep a one-shot print/JSON process
 alive until every child finishes. If the final answer must contain a child's
 result, use a foreground Agent or get_subagent_result({ agent_id, wait: true })
-before finishing. Explicit waits remain unbounded in V1.
+before finishing. Explicit waits remain unbounded.
 
 ## Existing controls and reliability
 
@@ -84,13 +89,15 @@ upstream completion-age cleanup policy.
 
 - #311 (8d56733): foreground/nested inline result IDs and tests.
 - #316 (75e0db9): dispose widget, group and debounce timers on shutdown.
-- #348 (1ecd1e5): unread retention and Pi 0.87 mention-clone compatibility.
+- #348 (1ecd1e5): unread retention. Its Pi 0.87-specific clone implementation is
+  superseded by upstream's Pi 1.1 session-entry clone; the history, branch and
+  exact-prompt regression scenarios remain covered.
 - #321 (c89d72a): only widget cadence/idle stop and tests; unrelated changes omitted.
 
 Original MIT license and author attribution are preserved.
 Upstream: https://github.com/tintinweb/pi-subagents
-Pi notification implementation: https://github.com/earendil-works/pi/blob/v0.87.1/packages/coding-agent/src/core/agent-session.ts
-Pi tool-batch/steering order: https://github.com/earendil-works/pi/blob/v0.87.1/packages/agent/src/agent-loop.ts
+Pi notification implementation: https://github.com/earendil-works/pi/blob/v1.1.0/packages/coding-agent/src/core/agent-session.ts
+Pi tool-batch/steering order: https://github.com/earendil-works/pi/blob/v1.1.0/packages/agent/src/agent-loop.ts
 
 ## Validation
 

@@ -115,22 +115,26 @@ describe("subagent usage reaches the parent session's stats (real pi)", () => {
   });
 
   it("leaves the context-window percentage alone", async () => {
-    // Compare identical transcripts: newer Pi estimates the tool-result text
-    // itself, but nested usage must not inflate the parent's context estimate.
+    // pi takes context usage from assistant messages; a tool result counts only
+    // by its own text. If the carried usage ever counted, a delegating session
+    // would look like it was filling its context with work that happened
+    // somewhere else entirely — and users would compact for no reason. The
+    // baseline is the same tool result without usage, because pi 1.x estimates
+    // the result's text into the percentage.
     const session = await realSession();
-    const control = await realSession();
+    const baseline = await realSession();
     try {
-      control.sessionManager.appendMessage(toolResultCarrying(undefined) as any);
-      const before = control.getSessionStats().contextUsage?.percent ?? null;
-
       const pool = new PendingUsagePool();
       pool.add({ input: 150_000, output: 400, cacheWrite: 100, cost: 1.5 });
       session.sessionManager.appendMessage(toolResultCarrying(pool.drain()) as any);
+      baseline.sessionManager.appendMessage(toolResultCarrying(undefined) as any);
 
-      expect(session.getSessionStats().contextUsage?.percent ?? null).toBe(before);
+      expect(session.getSessionStats().contextUsage?.percent ?? null).toBe(
+        baseline.getSessionStats().contextUsage?.percent ?? null,
+      );
     } finally {
-      control.dispose?.();
       session.dispose?.();
+      baseline.dispose?.();
     }
   });
 

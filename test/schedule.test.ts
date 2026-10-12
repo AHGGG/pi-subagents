@@ -326,6 +326,51 @@ describe("SubagentScheduler — fire path", () => {
     expect(optsArg.isBackground).toBe(true);
   });
 
+  describe("scheduled model provider selection", () => {
+    const parent = { provider: "provider-a", id: "parent-model", name: "Parent" };
+    const foreign = { provider: "provider-b", id: "gpt-6.1-sol", name: "GPT 6.1 Sol" };
+    const local = { ...foreign, provider: "provider-a" };
+
+    it.each([
+      { name: "bare override stays with the current provider", input: "gpt-6.1-sol", available: [foreign, local, parent], expected: local },
+      { name: "missing bare override cannot fall through to the agent file's other provider", input: "gpt-6.1-sol", available: [foreign, parent], expected: parent },
+      { name: "explicit provider/model switches provider", input: "provider-b/gpt-6.1-sol", available: [foreign, local, parent], expected: foreign },
+      { name: "missing explicit provider/model fails without trying another provider", input: "provider-c/gpt-6.1-sol", available: [foreign, parent], expected: "error" },
+      { name: "no override leaves the agent file's default available", input: undefined, available: [foreign, parent], expected: undefined },
+    ])("$name", ({ input, available, expected }) => {
+      ctx.model = parent;
+      ctx.modelRegistry = {
+        find: (provider: string, id: string) => available.find(m => m.provider === provider && m.id === id),
+        getAvailable: () => available,
+        getAll: () => available,
+      };
+      registerAgents(new Map([["provider-pinned", {
+        name: "provider-pinned", description: "An agent with another provider configured",
+        model: "provider-b/gpt-6.1-sol", systemPrompt: "", promptMode: "replace",
+        extensions: false, skills: false,
+      }]]));
+      const job = scheduler.addJob({
+        name: "provider-choice", description: "x", schedule: "+1s",
+        subagent_type: "provider-pinned", prompt: "x", model: input,
+      });
+
+      vi.advanceTimersByTime(1_000);
+
+      if (expected === "error") {
+        expect(manager.spawn).not.toHaveBeenCalled();
+        expect(store.get(job.id)?.lastStatus).toBe("error");
+        expect(pi.events.emit).toHaveBeenCalledWith("subagents:scheduled", expect.objectContaining({
+          type: "error", jobId: job.id, error: expect.stringContaining('in provider "provider-c"'),
+        }));
+        return;
+      }
+      expect(manager.spawn).toHaveBeenCalledOnce();
+      // An undefined model would let the runner reselect the pinned file's
+      // provider-b model. A concrete parent model prevents that second choice.
+      expect(manager.spawn.mock.calls[0][4].model).toBe(expected);
+    });
+  });
+
   it("fire passes the job's configuration as the invocation snapshot", () => {
     // A scheduled run has no tool call to build one, so without this the
     // conversation viewer can say nothing about how the job was configured.

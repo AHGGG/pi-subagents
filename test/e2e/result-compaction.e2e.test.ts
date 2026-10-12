@@ -1,6 +1,6 @@
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai";
 import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import subagents from "../../src/index.js";
 import { hermeticDir } from "../helpers/boot-extension.js";
@@ -26,6 +26,68 @@ describe("actual extension results across parent auto-compaction", () => {
     await session?.extensionRunner?.emit({ type: "session_shutdown", reason: "quit" });
     session?.dispose(); session = undefined;
     faux.unregister(); env.restore();
+  });
+
+  it("wakes an idle parent through the real extension and retrieves the completed child", async () => {
+    const childEntered = gate(), childRelease = gate();
+    releases.push(childRelease.resolve);
+    let parentPhase = 0;
+    let childId = "";
+    const sm = SessionManager.inMemory(env.dir);
+    const registry = () => (globalThis as unknown as Record<symbol, { getRecord(id: string): { status: string; resultConsumed?: boolean } }>)[Symbol.for("pi-subagents:manager")];
+    const respond = async (raw: Parameters<typeof modelContext>[0]) => {
+      const context = modelContext(raw);
+      if (!context.tools?.some(tool => tool.name === "Agent")) {
+        childEntered.resolve();
+        await childRelease.promise;
+        return fauxAssistantMessage([fauxText(FULL_A)]);
+      }
+      const phase = parentPhase++;
+      if (phase === 0) return fauxAssistantMessage([
+        fauxToolCall("Agent", { subagent_type: "general-purpose", description: "CHILD_A", prompt: "Return the requested report", isolated: true, run_in_background: true }),
+      ]);
+      if (phase === 1) {
+        await childEntered.promise;
+        for (const entry of sm.getBranch()) {
+          if (entry.type === "custom" && entry.customType === "subagents:run-start") {
+            childId = (entry.data as { id: string }).id;
+          }
+        }
+        return fauxAssistantMessage([fauxText("The helper is still working.")]);
+      }
+      if (phase === 2) {
+        expect(JSON.stringify(context.messages)).toContain(childId);
+        expect(JSON.stringify(context.messages)).toContain("A-PREVIEW-");
+        expect(JSON.stringify(context.messages)).not.toContain("A-SECRET-BEYOND-PREVIEW");
+        return fauxAssistantMessage([fauxToolCall("get_subagent_result", { agent_id: childId, wait: false })]);
+      }
+      expect(JSON.stringify(context.messages)).toContain("A-SECRET-BEYOND-PREVIEW");
+      return fauxAssistantMessage([fauxText("The helper result is now incorporated.")]);
+    };
+    faux.setResponses(Array.from({ length: 10 }, () => respond));
+    const settings = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
+    const backend = fauxModelBackend(faux.getModel());
+    const loader = new DefaultResourceLoader({ cwd: env.dir, agentDir: env.dir, settingsManager: settings,
+      noExtensions: true, noSkills: true, noPromptTemplates: true, noContextFiles: true, extensionFactories: [subagents] });
+    await loader.reload();
+    ({ session } = await createAgentSession({ cwd: env.dir, model: faux.getModel(), ...backend, sessionManager: sm, settingsManager: settings, resourceLoader: loader } as any));
+    await session.bindExtensions({ mode: "print" });
+    await session.prompt("Delegate the report and tell me when it is ready.");
+    const sessionId = session.sessionId;
+    expect(childId).toBeTruthy();
+    expect(session.isIdle).toBe(true);
+    expect(parentPhase).toBe(2);
+    expect(registry().getRecord(childId)?.status).toBe("running");
+
+    childRelease.resolve();
+    await vi.waitFor(() => {
+      expect(parentPhase).toBe(4);
+      expect(session!.isIdle).toBe(true);
+    }, { timeout: 5000, interval: 10 });
+    expect(session.sessionId).toBe(sessionId);
+    expect(registry().getRecord(childId)?.resultConsumed).toBe(true);
+    expect(session.messages.filter(message => message.role === "custom" && message.customType === "subagent-notification")).toHaveLength(1);
+    expect(session.messages.filter(message => message.role === "user")).toHaveLength(1);
   });
 
   it.each(["during-compaction", "after-compaction-tool"])("retrieves A when it finishes %s, while B keeps running", async timing => {

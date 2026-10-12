@@ -133,9 +133,14 @@ describe("toolDescriptionMode", () => {
       'isolation: "worktree"',
       ".pi/agents/",
       "self-contained",
+      "can wake an idle parent",
+      "get_subagent_result",
+      "wait: true",
     ]) {
       expect(desc).toContain(contract);
     }
+    expect(desc).not.toContain("not wake");
+    expect(desc).not.toContain("passive");
   });
 
   // The compact test above pins the prose alone, which is right for compact —

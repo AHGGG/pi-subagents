@@ -55,6 +55,41 @@ describe("execution finalization", () => {
     expect(manager.getRecord(a)!.status).toBe("error"); expect(manager.getRecord(b)!.status).toBe("completed");
     expect((manager as any).runningBackground).toBe(0);
   });
+  it("a handoff during preservation finalizes once and releases the background slot", async () => {
+    const pi = {} as Parameters<AgentManager["spawn"]>[0];
+    const ctx = { cwd: process.cwd() } as Parameters<AgentManager["spawn"]>[1];
+    const cleanup = gate<Awaited<ReturnType<typeof cleanupWorktree>>>();
+    vi.mocked(createWorktree).mockResolvedValue({ path: "/tmp/work", workPath: "/tmp/work", baseSha: "base", branch: "saved" });
+    vi.mocked(cleanupWorktree).mockReturnValue(cleanup.promise);
+    const onComplete = vi.fn();
+    manager = new AgentManager(onComplete, 1);
+    manager.setMaxConcurrentForeground(1);
+    const waiting = manager.spawnAndWait(pi, ctx, "general-purpose", "work", { description: "work", isolation: "worktree" });
+    await flush();
+    const record = manager.listAgents()[0];
+    expect(manager.isRunPending(record)).toBe(true);
+    expect(onComplete).not.toHaveBeenCalled();
+    expect(manager.sendToBackground(record.id)).toBe(true);
+    expect(await manager.resume(record.id, "too early")).toBeUndefined();
+
+    const next = manager.spawn(pi, ctx, "general-purpose", "next", { description: "next", isBackground: true });
+    expect(manager.getRecord(next)?.status).toBe("queued");
+    let ready = false;
+    const waiter = manager.waitForResult(record.id).then(() => { ready = true; });
+    await flush();
+    expect(ready).toBe(false);
+    cleanup.resolve({ hasChanges: true, branch: "saved" });
+    await waiting;
+    await waiter;
+    await manager.waitForResult(next);
+    expect(record.result).toContain("Changes saved to branch `saved`");
+    expect(record.resultConsumed).toBe(false);
+    expect(record.runSettled).toBe(true);
+    expect(record.chargedPool).toBeUndefined();
+    expect(onComplete.mock.calls.filter(([completed]) => completed.id === record.id)).toHaveLength(1);
+    expect(manager.getRecord(next)?.status).toBe("completed");
+    expect(manager.hasRunning()).toBe(false);
+  });
   it("rejecting execution plus throwing completion callback still drains the queue", async () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
     let reject!: (error: Error) => void;

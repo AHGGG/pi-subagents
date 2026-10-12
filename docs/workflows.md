@@ -12,7 +12,7 @@ Until workflows existed, the only way to run several agents at once was to name 
 
 A script can loop, branch, and fan out over a list discovered at runtime. A batch of tool calls cannot. Each `agent()` call in the script spawns a real subagent with its own context window, its own tools, and its own model — the script is only the coordinator, and it has no filesystem or network of its own.
 
-Use the `Agent` tool for one delegated task, or a handful you can name up front. Reach for a workflow when the *number* of agents depends on something discovered at runtime, when work flows through stages, or when you want findings independently verified before you believe them. It costs a subprocess per agent, so it is not the thing to dress a single task up as.
+Use the `Agent` tool for one delegated task, or a handful you can name up front. Reach for a workflow when the *number* of agents depends on something discovered at runtime, when work flows through stages, or when you want findings independently verified before you believe them. Each child creates a Pi session and can load its own extensions and MCP servers, so reserve workflows for tasks that need that orchestration.
 
 ## The lifecycle
 
@@ -241,7 +241,7 @@ Spawns one subagent and resolves to its final text — or, with `schema`, to a v
 | `agentType` | string | Which agent definition to use. Defaults to `general-purpose`; built-ins are `general-purpose`, `Explore`, `Plan`, plus your custom agents |
 | `model` | string | Bare ID/name (for example `haiku`) stays on the parent provider; `provider/modelId` switches providers explicitly |
 | `effort` | string | `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Omitted, the agent definition's own `thinking` decides, then the parent's |
-| `isolation` | `"worktree"` | Run in a throwaway git worktree. Only when agents write files in parallel and would collide — it costs setup time and disk per agent |
+| `isolation` | `"worktree"` | Run in a throwaway git worktree. Only when agents write files in parallel and would collide — it costs setup time and disk per agent. Only this option decides, as in Claude Code — an agent file's `isolation:` does not apply to workflow children |
 | `gate` | string | A shell command run after the agent finishes; a non-zero exit fails the agent and its output becomes the error |
 | `resume` | string | Continue the child that ran under that label instead of starting fresh |
 | `schema` | object | A JSON Schema with an object root. Resolves to the validated object instead of text |
@@ -249,6 +249,8 @@ Spawns one subagent and resolves to its final text — or, with `schema`, to a v
 Any other key is rejected **by name** at the call. Note that this checks option *keys*, not option *values* — an `agentType` that names no known agent falls back to `general-purpose` silently.
 
 Combination rules: `resume` cannot be combined with `agentType`, `model`, `effort`, `isolation`, `gate` or `schema` — a resumed child keeps the agent type, model and tree it was started with, and its session predates the `StructuredOutput` tool.
+
+An agent definition's `isolated: true` is enforced for workflow children: it disables extensions, skills and nested delegation. This differs from `isolation: "worktree"`, which is controlled only by the script's `agent()` option. The fork keeps worktree preservation pending until it finishes; if Git preservation or removal fails, the retained worktree and error are reported. Workflow children report through their run and cannot be handed to the main session with `ctrl+b`.
 
 ### `pipeline()` and `parallel()`
 

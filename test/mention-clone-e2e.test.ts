@@ -16,6 +16,7 @@ it("the real clone receives the live prompt and restored history, with only its 
   try {
     const model = faux.getModel();
     const backend = fauxModelBackend(model);
+    const livePrompt = `LIVE-PROMPT-MARKER\n\n<cwd>\n${cwd}\n</cwd>`;
     const parent = SessionManager.inMemory(cwd);
     const kept = parent.appendMessage({ role: "user", content: "HISTORY-MARKER", timestamp: 1 });
     parent.appendCompaction("SUMMARY-MARKER", kept, 1000);
@@ -36,11 +37,11 @@ it("the real clone receives the live prompt and restored history, with only its 
     const ctx = {
       cwd, model, thinkingLevel: "off", sessionManager: parent,
       modelRegistry: { ...backend.modelRegistry, runtime: backend.modelRuntime },
-      getSystemPrompt: () => "LIVE-PROMPT-MARKER",
+      getSystemPrompt: () => livePrompt,
     } as unknown as ExtensionContext;
     const result = await runMentionClone({ ctx, type: "general-purpose", message: "MENTION-MARKER", agentTool: tool });
     expect(requests).toHaveLength(1);
-    expect(requests[0].systemPrompt).toBe("LIVE-PROMPT-MARKER");
+    expect(requests[0].systemPrompt).toBe(livePrompt);
     expect(requests[0].tools?.map(t => t.name)).toEqual(["Agent"]);
     const text = JSON.stringify(requests[0].messages);
     expect(text).toContain("HISTORY-MARKER");

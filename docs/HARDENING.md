@@ -1,11 +1,14 @@
-# Personal fork hardening — 0.19.0-ahggg.3
+# Personal fork hardening
+
+Introduced in `0.19.0-ahggg.3`; retained in **0.20.0-ahggg.1**.
+See [upstream sync decisions](UPSTREAM_SYNC.md) for the Pi 1.1 integration.
 
 Install/update from Git:
 
     pi update git:github.com/AHGGG/pi-subagents
 
 Restart Pi after active children finish. No npm publication or new setting is needed.
-Requires Pi >= 0.87.1; deterministic tests target the pinned 0.87.1 runtime.
+Requires Pi **1.1.0 or newer**; deterministic tests target the pinned 1.1.0 runtime.
 
 ## Result retrieval
 
@@ -30,8 +33,9 @@ messages. Recovery cannot reconstruct a result that was never successfully recor
 
 Consumed runtime records still use the existing completion-age cleanup policy;
 unread results are retained in memory without a new size/TTL cap. Reading a saved
-result does not restore a resumable runtime. Restarting/resuming agents from disk
-(PR #286's broader behavior) is not included. Session files can grow with saved
+result does not restore a resumable runtime. Separately, the existing `@handle`
+flow can reopen a persisted child session after its live record is evicted; that
+is an explicit continuation and can spend model tokens. Session files can grow with saved
 result text; this patch does not introduce a database, retention service or index.
 
 ## Execution lifecycle
@@ -48,6 +52,12 @@ Slots are released once, and a reporting or persistence callback failure cannot
 prevent the queue from progressing. Failures are warned about, not represented
 as successful persistence.
 
+Upstream's `ctrl+b` handoff uses the same finalization path. It keeps the current
+session and worktree running, detaches the original foreground caller's abort
+listener, and moves the concurrency slot to the background pool. A handed-off
+run is recorded and notifies when finalization finishes. Foreground resumes,
+queued calls, nested children and workflow-owned agents do not offer handoff.
+
 ## Worktree safety
 
 A clean unchanged worktree can be removed. Changed work is removed only after
@@ -56,7 +66,7 @@ its path and the Git error. If only removal fails, both saved branch and retaine
 path are reported. A missing worktree is not reported as verified clean.
 The extension does not disable Git signing or overwrite existing branches.
 
-## Unchanged behavior
+## Completion behavior
 
 Automatic completion delivery remains steer + triggerTurn: true. Current tools
 finish before the notice is handled; an idle main agent can wake automatically.
@@ -74,4 +84,4 @@ completing during/after parent auto-compaction. The compaction integration uses
 Pi's public custom-summary hook for deterministic text; threshold detection,
 context replacement, completion queueing and get_subagent_result are real.
 No paid/live-model test or manual Windows/macOS terminal certification is implied.
-See the release pull request for the actually executed results and exact SHA.
+See [sync validation](UPSTREAM_SYNC.md#validation) for the merge's validation scope.

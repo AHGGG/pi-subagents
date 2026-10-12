@@ -24,8 +24,10 @@ jobs:
       - run: npm run build
       - run: npm run test:e2e
 
-  # The lockfile pins the minimum supported Pi. Newer Pi versions are a canary,
-  # not an implicit compatibility guarantee for this personal fork.
+  # The lockfile and build job test the minimum supported Pi (1.1.0).
+  # Host-provided packages use "*" peers as required by Pi's extension loader.
+  # A separate floor job would duplicate build until the development pin moves.
+  # Newer Pi versions are a canary, not an implicit compatibility guarantee.
   compat-latest-pi:
     runs-on: ubuntu-latest
     timeout-minutes: 15
