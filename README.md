@@ -34,7 +34,7 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 - **Tool denylist** — block specific tools via `disallowed_tools` frontmatter
 - **Styled completion notifications** — background agent results render as themed, compact notification boxes (icon, stats, result preview) instead of raw XML. Expandable to show full output. Group completions render each agent individually
 - **Event bus** — lifecycle events (`subagents:created`, `started`, `completed`, `failed`, `steered`, `compacted`) and a per-message spend ledger (`subagents:usage`) emitted via `pi.events`, enabling other extensions to react to sub-agent activity
-- **Cross-extension RPC** — other pi extensions can spawn, stop, and join subagents via the `pi.events` event bus (`subagents:rpc:ping`, `subagents:rpc:spawn`, `subagents:rpc:stop`, `subagents:rpc:consume`). Standardized reply envelopes with protocol versioning. Emits `subagents:ready` on session start. **[Full reference](https://github.com/tintinweb/pi-subagents/blob/master/docs/rpc.md)**
+- **Cross-extension RPC** — other pi extensions can spawn, stop, steer, and join subagents via the `pi.events` event bus (`subagents:rpc:ping`, `subagents:rpc:spawn`, `subagents:rpc:stop`, `subagents:rpc:consume`, `subagents:rpc:steer`). Standardized reply envelopes with protocol versioning. Emits `subagents:ready` on session start. **[Full reference](https://github.com/tintinweb/pi-subagents/blob/master/docs/rpc.md)**
 - **Schedule subagents** — pass `schedule` to the `Agent` tool to fire on cron / interval / one-shot. Session-scoped jobs with PID-locked persistence; results arrive as the same completion notification as a manual background agent; manage via `/agents → Scheduled jobs`
 - **Model scope enforcement** — opt-in validation that subagent model choices stay within your pi `enabledModels` allowlist (sourced from `/scoped-models`, with both global and project-local pi settings honored). Caller-supplied out-of-scope → hard error to orchestrator; frontmatter-pinned out-of-scope → warning + runs anyway (frontmatter authoritative). Toggle via `/agents → Settings → Scope models`
 
@@ -804,7 +804,7 @@ Agent lifecycle events are emitted via `pi.events.emit()` so other extensions ca
 | `subagents:started` | Agent transitions to running (including queued→running) | `id`, `type`, `description` |
 | `subagents:completed` | Agent finished successfully (background and foreground) | `id`, `type`, `description`, `status`, `durationMs`, `tokens` (display total, `{ input, output, total }` — see the note below), `usage` (the run's spend as a pi `Usage`: token components including `cacheRead`, plus `cost.total` in USD; absent when nothing was spent), `toolUses`, `result` |
 | `subagents:failed` | Agent errored, stopped, or aborted (background and foreground) | identical payload to `subagents:completed` — both are built by the same formatter, so `error` and `status` are present on that row too, just empty |
-| `subagents:steered` | Steering message accepted — fires for a *queued* steer as well as a delivered one | `id`, `message` |
+| `subagents:steered` | Steering message accepted from any path (`steer_subagent`, `@handle`, the viewers, `subagents:rpc:steer`) — fires for a *queued* steer as well as a delivered one | `id`, `message` |
 | `subagents:usage` | Every assistant message any agent spends on — top-level, nested and workflow children alike, live while it runs | Always: `id`, `type`, `description`, `depth`, `usage` (that one message's spend as a pi `Usage`; never emitted for a message that spent nothing). Omitted when unknown, never `undefined`: `model` (`provider/id`) and `thinking` (the effective level) until the session has reported them; `requestedThinking`, only when the agent did not get the level it asked for; `parentAgentId`, nested agents only; `workflowId`, a workflow's agents only |
 | `subagents:compacted` | Agent's session successfully compacted | `id`, `type`, `description`, `reason` (`"manual"` / `"threshold"` / `"overflow"`), `tokensBefore`, `compactionCount` |
 | `subagents:disposed` | End of `session_shutdown`, after every agent is stopped and every child session has shut down — no `subagents:usage` can follow it. A ledger flushing in its own `session_shutdown` may run before the agents are aborted; flush again here, **synchronously** (`writeFileSync`, not `fs.promises`): `emit` does not await listeners and pi calls `process.exit` once the shutdown handlers return, so nothing after a listener's first `await` is guaranteed to run | `{}` |
@@ -903,6 +903,16 @@ pi.events.emit("subagents:rpc:consume", { requestId: crypto.randomUUID(), agentI
 ```
 
 This is the bus-side half of what `get_subagent_result` does when it returns a result. A caller that joins an agent on `subagents:completed` and reports the result itself should consume it — otherwise the notification still reaches a parent that has already seen the result, costing a model call to dismiss. Fire-and-forget is the intended use: the reply carries nothing to act on, and the channel is outside the `subagents:rpc:ping` version handshake, so a caller can send it unconditionally and an older extension that has no handler simply keeps notifying. Consuming a running or unknown agent is refused (`success: false`) and changes nothing — a running agent has no result to have been read, and its notification is still the caller's only signal that it finished.
+
+### Steer
+
+Deliver a message to a running agent you spawned, when something it needs arrives mid-run (the bus-side half of `steer_subagent`):
+
+```typescript
+pi.events.emit("subagents:rpc:steer", { requestId: crypto.randomUUID(), agentId: "agent-id-here", message: "A second check failed on the same head; include it before you push." });
+```
+
+Same ownership guard as stop; `Agent is not running` once the agent has settled. A successful steer emits `subagents:steered`.
 
 Reply channels are scoped per `requestId`, so concurrent requests don't interfere.
 
@@ -1042,7 +1052,7 @@ src/
   model-scope.ts      # scopeModels allowlist policy, shared by top-level and nested tools
   mention.ts          # `@handle message` grammar: suggestion triggers and send parsing
   mention-clone.ts    # Run a mention's turn in a cloned conversation, off the main chat
-  cross-extension-rpc.ts # RPC handlers for cross-extension spawn/ping via pi.events
+  cross-extension-rpc.ts # ping/spawn/stop/consume/steer RPC handlers over pi.events
 
   # Scheduling
   schedule.ts         # SubagentScheduler: cron / +10m / interval / ISO dispatch

@@ -682,6 +682,9 @@ export default function (pi: ExtensionAPI) {
       ...(record.workflowId !== undefined ? { workflowId: record.workflowId } : {}),
       usage: reported,
     });
+  }, (record, message) => {
+    if (!isTopLevelAgent(record)) return;
+    pi.events.emit("subagents:steered", { id: record.id, message });
   });
 
   // Expose manager via Symbol.for() global registry for cross-package access.
@@ -867,6 +870,7 @@ export default function (pi: ExtensionAPI) {
             outbox.cancel(record.id);
             return true;
           },
+          steer: (id, message) => manager.steer(id, message),
         },
       });
       // Broadcast readiness so extensions loaded alongside us can discover us.
@@ -967,7 +971,6 @@ export default function (pi: ExtensionAPI) {
         // this message is still relayed even if the LLM read its last answer.
         record.resultConsumed = false;
         manager.steer(record.id, mention.message);
-        pi.events.emit("subagents:steered", { id: record.id, message: mention.message });
         ctx.ui.notify(`Sent to ${target}`, "info");
         return { action: "handled" };
       }
@@ -1147,6 +1150,7 @@ export default function (pi: ExtensionAPI) {
     rpcHandle?.unsubStop();
     rpcHandle?.unsubPing();
     rpcHandle?.unsubConsume();
+    rpcHandle?.unsubSteer();
     rpcHandle = undefined;
     currentCtx = undefined;
     // Only release the global slot if this activation claimed it — a child
