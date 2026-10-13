@@ -643,12 +643,45 @@ export default function (pi: ExtensionAPI) {
       tokensBefore: info.tokensBefore,
       compactionCount: record.compactionCount,
     });
-  }, (_record, usage) => {
+  }, (record, usage) => {
     // Every assistant message from every agent — nested included, exactly once.
     // Parked here until a tool result can carry it back to the parent session;
     // see `PendingUsagePool`. Skipped entirely when the feature is off, so no
     // pool grows in a session that will never drain it.
     if (reportUsage) pendingUsage.add(usage);
+    // The same message, live, for anyone keeping their own ledger — a footer
+    // that breaks spend down by agent type and thinking level, say. This is the
+    // one place every agent's spend passes through, which is why it is emitted
+    // here and not from the lifecycle events: those fire for top-level agents
+    // only, once, at the end, so a workflow's children and nested agents would
+    // never be counted, and a running agent would read as free until it
+    // stopped. Deliberately ungated by `reportUsage` — that decides whether the
+    // parent session's own totals include this spend, not whether it happened.
+    //
+    // `model` and `thinking` are read off the record per message, not captured
+    // at spawn: the record is authoritative only once the session exists and pi
+    // has clamped the level to the model (see `onSessionCreated`).
+    const reported = toReportedUsage(usage);
+    if (!reported) return;
+    // A key whose value is unknown is omitted, never `undefined`: `model` and
+    // `thinking` until the session has reported them, `parentAgentId` and
+    // `workflowId` on a top-level agent.
+    const invocation = record.invocation;
+    pi.events.emit("subagents:usage", {
+      id: record.id,
+      type: record.type,
+      description: record.description,
+      ...(invocation?.modelId !== undefined ? { model: invocation.modelId } : {}),
+      ...(invocation?.thinking !== undefined ? { thinking: invocation.thinking } : {}),
+      // Set only when the caller did not get the level it asked for (pi
+      // clamped it to the model, or an agent file outranked it), so a ledger
+      // can show `low (asked minimal)` instead of silently relabelling.
+      ...(invocation?.requestedThinking !== undefined ? { requestedThinking: invocation.requestedThinking } : {}),
+      depth: record.depth ?? 1,
+      ...(record.parentAgentId !== undefined ? { parentAgentId: record.parentAgentId } : {}),
+      ...(record.workflowId !== undefined ? { workflowId: record.workflowId } : {}),
+      usage: reported,
+    });
   });
 
   // Expose manager via Symbol.for() global registry for cross-package access.
@@ -1145,6 +1178,13 @@ export default function (pi: ExtensionAPI) {
     // pi awaits this handler, and the process exits right after — unawaited, those
     // handlers would never run. Internally bounded, so a hung one can't strand quit.
     await manager.dispose(pi);
+    // Every agent is stopped and every child session has shut down, so no more
+    // `subagents:usage` can arrive. A ledger flushing in its own
+    // `session_shutdown` may have run before this handler aborted the agents
+    // (handlers run in load order) and missed their last messages; this is the
+    // point after which a synchronous final flush is complete. Synchronous:
+    // `emit` does not await listeners, and pi exits once this handler returns.
+    pi.events.emit("subagents:disposed", {});
   });
 
   // Live widget: show running agents above editor.
