@@ -386,8 +386,8 @@ export function setDefaultMaxTurns(n: number | undefined): void { defaultMaxTurn
  * before the run starts, and a second copy of the expression would drift from
  * the one below that enforces it.
  */
-export function resolveEffectiveMaxTurns(type: string | undefined, explicit?: number): number | undefined {
-  return normalizeMaxTurns(explicit ?? (type === undefined ? undefined : getAgentConfig(type)?.maxTurns) ?? defaultMaxTurns);
+export function resolveEffectiveMaxTurns(type: string, explicit?: number): number | undefined {
+  return normalizeMaxTurns(explicit ?? getAgentConfig(type)?.maxTurns ?? defaultMaxTurns);
 }
 
 /**
@@ -1279,9 +1279,9 @@ export async function resumeAgent(
   session: AgentSession,
   prompt: string,
   options: Pick<RunOptions, "maxTurns" | "onTurnEnd" | "onToolActivity" | "onAssistantUsage" | "onCompaction" | "signal"> & {
-    /** The agent's type, for its own `max_turns`. Omitted: only `maxTurns` and the default apply. */
-    type?: SubagentType;
-  } = {},
+    /** The agent's type, for its own `max_turns`. */
+    type: SubagentType;
+  },
 ): Promise<{ text: string; failure?: string } & Pick<RunResult, "aborted" | "steered">> {
   // Boundary for the history fallback: the session already holds prior turns,
   // so only assistant text produced by THIS resume prompt counts as its output

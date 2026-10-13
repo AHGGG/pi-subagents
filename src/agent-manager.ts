@@ -317,9 +317,9 @@ interface ResumeOptions {
    */
   isBackground?: boolean;
   /**
-   * Explicit turn limit for the resumed run. Resolved like a spawn's: this,
-   * else the record's type's own `max_turns`, else the default — and counted
-   * afresh from the resume prompt (#368).
+   * Explicit turn limit for the resumed run: this, else the limit the agent
+   * was spawned with, else its type's own `max_turns`, else the default —
+   * counted afresh from the resume prompt (#368).
    */
   maxTurns?: number;
   /** Called at the end of each resumed turn with the count since the resume. */
@@ -886,28 +886,13 @@ export class AgentManager {
       },
     })
       .then(async ({ responseText, session, aborted, steered, failure, structuredJson, structuredRetried }) => {
-        // Don't overwrite status if externally stopped via abort()
-        if (record.status !== "stopped") {
-          // Precedence: a hard abort keeps "aborted"; then a failed final turn
-          // (provider error that pi resolved instead of rejecting, #144) is an
-          // honest "error" — not a completion with an empty or stale result.
-          if (aborted) {
-            record.status = "aborted";
-          } else if (failure) {
-            record.status = "error";
-            record.error = failure;
-          } else {
-            record.status = steered ? "steered" : "completed";
-          }
-        }
-        record.result = responseText;
+        this.settleOutcome(record, { text: responseText, failure, aborted, steered });
         // Kept beside `result`, never inside it: `result` is prose meant for a
         // reader — it is previewed, transcribed, and appended to below — while
         // this is a machine-readable payload one caller asked for by schema.
         record.structuredJson = structuredJson;
         record.structuredRetried = structuredRetried;
         record.session = session;
-        record.completedAt ??= Date.now();
 
         detach();
 
@@ -1253,11 +1238,22 @@ export class AgentManager {
     record.completedAt = undefined;
     record.result = undefined;
     record.error = undefined;
+    // Fresh controller, as on the detached path: `abort()` fires whatever
+    // `record.abortController` holds, and the spawn's has long settled — so a
+    // stop from `/agents` or the caller's Esc would mark the record stopped
+    // while the resumed prompt ran on to completion.
+    const abortController = new AbortController();
+    record.abortController = abortController;
+    this.armParentAbort(record, signal);
+    // `addEventListener` never fires on a signal that is already aborted, and
+    // the runner skips the prompt only when ITS signal is — stop now, so that
+    // holds for a resume issued on a call that was cancelled first.
+    if (signal?.aborted) this.abort(id);
 
     try {
-      this.settleResume(record, await resumeAgent(record.session, prompt, {
+      this.settleOutcome(record, await resumeAgent(record.session, prompt, {
         type: record.type,
-        maxTurns: options?.maxTurns,
+        maxTurns: options?.maxTurns ?? record.invocation?.maxTurns,
         onTurnEnd: options?.onTurnEnd,
         onToolActivity: (activity) => {
           if (activity.type === "end") record.toolUses++;
@@ -1273,13 +1269,12 @@ export class AgentManager {
           this.onCompact?.(record, info);
           options?.onCompaction?.(info);
         },
-        signal,
+        signal: abortController.signal,
       }));
     } catch (err) {
-      record.status = "error";
-      record.error = err instanceof Error ? err.message : String(err);
-      record.completedAt = Date.now();
+      this.failResume(record, err);
     }
+    this.detachParentAbort(record);
 
     // Same contract as the spawn settle paths: children spawned during the
     // resumed turn must not outlive it — nothing else can see or reach them.
@@ -1289,13 +1284,14 @@ export class AgentManager {
   }
 
   /**
-   * Write a resumed run's outcome onto its record, with the spawn path's
+   * Write a run's outcome onto its record — a spawn's or a resume's, with one
    * precedence: an external stop keeps "stopped"; a hard abort (turn limit +
-   * grace) is "aborted"; a failed final turn is an "error", not a completion
-   * (#144); otherwise "steered" or "completed". The resumed text stays
+   * grace) is "aborted"; a failed final turn (a provider error pi resolved
+   * instead of rejecting, #144) is an "error", not a completion with an empty
+   * or stale result; otherwise "steered" or "completed". The run's text stays
    * available in every case.
    */
-  private settleResume(
+  private settleOutcome(
     record: AgentRecord,
     { text, failure, aborted, steered }: Awaited<ReturnType<typeof resumeAgent>>,
   ): void {
@@ -1310,6 +1306,15 @@ export class AgentManager {
       }
     }
     record.result = text;
+    record.completedAt ??= Date.now();
+  }
+
+  /** A resume whose runner rejected: an error, unless an external stop got there first. */
+  private failResume(record: AgentRecord, err: unknown): void {
+    if (record.status !== "stopped") {
+      record.status = "error";
+      record.error = err instanceof Error ? err.message : String(err);
+    }
     record.completedAt ??= Date.now();
   }
 
@@ -1370,7 +1375,7 @@ export class AgentManager {
 
     const promise = resumeAgent(record.session, prompt, {
       type: record.type,
-      maxTurns: options.maxTurns,
+      maxTurns: options.maxTurns ?? record.invocation?.maxTurns,
       onTurnEnd: options.onTurnEnd,
       onToolActivity: (activity) => {
         if (activity.type === "end") record.toolUses++;
@@ -1389,16 +1394,12 @@ export class AgentManager {
       signal: abortController.signal,
     })
       .then((outcome) => {
-        this.settleResume(record, outcome);
+        this.settleOutcome(record, outcome);
         settle();
         return outcome.text;
       })
       .catch((err) => {
-        if (record.status !== "stopped") {
-          record.status = "error";
-          record.error = err instanceof Error ? err.message : String(err);
-        }
-        record.completedAt ??= Date.now();
+        this.failResume(record, err);
         settle();
         return "";
       });
