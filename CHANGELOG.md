@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-10-13
+
 > **⚠️ Possibly breaking — background completion delivery changed ([#388](https://github.com/tintinweb/pi-subagents/pull/388)):**
 > - **`smart`, the default join mode, no longer combines a turn's background agents into one notification.** Each result reaches the parent at its next boundary, so a parent waiting idle on several agents can take one turn per finish. Set the join mode to `group` for one notification per turn's batch.
 > - **A completion pending when you press Esc now starts a turn once the interrupted turn stops.**
@@ -21,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **Background completions that finish together reach the parent as one message, and none waits for its siblings, as in Claude Code** ([#388](https://github.com/tintinweb/pi-subagents/pull/388)). A busy parent gets everything that finished during its tool batch in one message before its next model call; an idle parent gets a turn about 200 ms after a completion, with anything else that finished in that window. The default `smart` join mode no longer holds a finished agent for up to 30 s until its siblings finish (`async` now means the same as `smart`). `group` batches by parent turn instead of a 100 ms spawn window, so worktree agents group reliably. A completion pending when you press Esc is no longer dropped: it is delivered once the interrupted turn stops, starting a turn, as Claude Code does. `get_subagent_result` now suppresses a notification any time before it is sent, not only within 200 ms.
+
+### Fixed
+- **`session_shutdown` now disposes the widget and group-join manager** (fixes [#256](https://github.com/tintinweb/pi-subagents/issues/256), [#316](https://github.com/tintinweb/pi-subagents/pull/316) — thanks [@joshua-zyy](https://github.com/joshua-zyy)). The handler released the fleet, scheduler and manager but left the `AgentWidget` render interval and the `GroupJoinManager` group timeouts running. Because `session_shutdown` also fires on reload and session replacement, where the Node process survives, those timers outlived the activation and fired into the next session's UI and group state, accumulating across reloads. `session_before_switch` still keeps both, since a vetoed switch continues the session.
 
 ## [0.21.0] - 2026-10-12
 
