@@ -23,8 +23,12 @@ For a new installation, remove any upstream copy first, then install:
 
 If upstream was installed by another Git/local source, remove that exact source
 instead. Restart Pi after running agents finish, or use /reload when none remain.
-The fork loads src/index.ts directly; no separate clone/build or npm publication
-is needed. Do not install the unpublished @ahggg/pi-subagents npm name.
+The fork loads the compiled dist/index.js entry. Git installation and updates
+run the prepare script to build it automatically; when development dependencies
+are omitted, the script downloads TypeScript through npx. No separate manual
+build or npm publication is needed. Do not install the unpublished
+@ahggg/pi-subagents npm name. For development, pi -e ./src/index.ts still loads
+source directly; rebuild after source edits when loading the package entry.
 
 ## Completion contract
 
