@@ -1,9 +1,8 @@
 /**
  * shutdown-disposal.test.ts — pins #256: the root activation's `session_shutdown`
  * handler must also release the activation-owned resources it used to skip —
- * `AgentWidget` (the 80ms render interval and registered UI state),
- * `GroupJoinManager` (pending 30s group timeouts), and the `finalizeBatch`
- * debounce (100ms).
+ * `AgentWidget` (the render interval and registered UI state),
+ * `GroupJoinManager` (pending 30s group timeouts), and pending turn groups.
  *
  * Why it matters: `session_shutdown` also runs for reload/session replacement,
  * where the Node process continues. A pending timer from the old activation can
@@ -55,6 +54,7 @@ function makePi() {
 
 function ctx() {
   return {
+    signal: new AbortController().signal,
     hasUI: false,
     ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() },
     cwd: process.cwd(),
@@ -91,7 +91,7 @@ describe("session_shutdown disposes activation-owned resources (#256)", () => {
     process.env.HOME = agentDir;
     prevCwd = process.cwd();
     mkdirSync(join(tmpDir, ".pi"), { recursive: true });
-    writeFileSync(join(tmpDir, ".pi", "subagents.json"), JSON.stringify({ schedulingEnabled: false }));
+    writeFileSync(join(tmpDir, ".pi", "subagents.json"), JSON.stringify({ schedulingEnabled: false, defaultJoinMode: "smart" }));
     process.chdir(tmpDir);
   });
 
@@ -134,13 +134,14 @@ describe("session_shutdown disposes activation-owned resources (#256)", () => {
     await lifecycle.get("session_shutdown")?.({}, ctx());
   });
 
-  it("cancels a pending batch debounce — no stale group registers after shutdown", async () => {
+  it("clears a pending turn batch — no stale group registers after shutdown", async () => {
     const { pi, tools, lifecycle } = makePi();
     const registerGroup = vi.spyOn(GroupJoinManager.prototype, "registerGroup");
     subagentsExtension(pi);
+    const context = ctx();
+    await lifecycle.get("session_start")({}, context);
 
-    // Two background agents land in the same 100ms batch window; both complete
-    // during it, so batch finalization is deferred to the debounce.
+    // Two background agents complete before their parent's turn boundary.
     vi.mocked(runAgent).mockResolvedValue({
       responseText: "THE-RESULT-PAYLOAD",
       session: { dispose: vi.fn() } as any,
@@ -153,21 +154,16 @@ describe("session_shutdown disposes activation-owned resources (#256)", () => {
         { prompt: "go", description, subagent_type: "general-purpose", run_in_background: true },
         undefined,
         undefined,
-        ctx(),
+        context,
       );
       expect(textOf(spawn).match(/Agent ID: (\S+)/)?.[1], "spawn should surface an agent id").toBeTruthy();
     }
-    await flush(); // completions settle; the 100ms batch debounce is still pending
+    await flush();
 
-    // Shutdown fires well inside the debounce window.
-    await lifecycle.get("session_shutdown")?.({}, ctx());
+    // Shutdown precedes the turn boundary that would register the group.
+    await lifecycle.get("session_shutdown")?.({}, context);
 
-    // Past the 100ms debounce: without the fix, the surviving timer runs
-    // finalizeBatch here and registers a stale group — with its own 30s
-    // timeout — into the never-disposed GroupJoinManager, retaining the old
-    // activation and letting its callbacks run against stale state. (The
-    // per-record notification loop is a no-op post-dispose since manager
-    // records are cleared, so the group registration itself is the leak.)
+    lifecycle.get("turn_end")({ message: { role: "assistant", stopReason: "toolUse" } });
     await new Promise((r) => setTimeout(r, 300));
     expect(registerGroup).not.toHaveBeenCalled();
     expect(pi.sendMessage).not.toHaveBeenCalled();

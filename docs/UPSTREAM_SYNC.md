@@ -1,4 +1,80 @@
-# Upstream sync — 0.20.0-ahggg.1
+# Upstream sync — 0.22.0-ahggg.1
+
+Sync target: [`tintinweb/pi-subagents@ca93a52`](https://github.com/tintinweb/pi-subagents/commit/ca93a52).
+Fork starting point: [`AHGGG/pi-subagents@c3f693f`](https://github.com/AHGGG/pi-subagents/commit/c3f693f).
+Shared base: `7d83085d81f53e48a4b69933434d94ce545eb63d`.
+
+The fork was 17 commits ahead and 12 behind. This merge keeps both histories and
+imports upstream 0.22.0 plus its subsequent usage, RPC and resume fixes. Pi 1.1.0
+remains the supported minimum and pinned development runtime.
+
+## Current merge decisions
+
+- Adopt the completion outbox: everything ready during a parent tool batch
+  arrives as one steering message at the next boundary. An idle parent still
+  wakes after a 200 ms hold. Running tools are not interrupted.
+- Preserve the fork's stale-execution policy. Accepting a resume cancels the
+  prior pending notice; delivery checks run ID, promise identity, finalization
+  and consumption. Upstream's tests intentionally expect the older notice after
+  a resume, so those two assertions are adapted to the fork's contract.
+- Keep `async` as the default and retain explicit `smart`/`group` sibling waits.
+  Groups now use the whole parent turn instead of the spawn debounce. Lone
+  spawns and off-turn spawns notify individually. Upstream makes `smart` an
+  alias for `async`; this fork deliberately does not.
+- Import resumed-run `max_turns`, turn counters, stopped/steered/aborted results
+  and RPC steering into the existing unified run lifecycle. Keep finalization
+  after worktree preservation, fresh run identities and once-only pool release.
+- Keep exact-ID saved-result recovery across cleanup and compaction, including
+  accepted-run barriers and foreground results. The old upstream completion-only
+  persistence callback is not restored.
+- Keep parent-provider-only bare model routing, unread-result retention,
+  resumable IDs, worktree failure preservation and the idle-safe widget.
+- Adopt package agents/workflows and per-message usage/disposed events. Package
+  resources remain lower priority than local agents and obey project trust.
+- Use upstream's shutdown disposal once; turn-boundary batching removes the
+  old debounce timer. Preserve the fork package identity, private flag and `*`
+  host peers while accepting Vitest/coverage 4.1.11.
+
+## Imported commits
+
+| Commit | Change |
+|---|---|
+| `26c23bb` | 0.21.0 release and scripted steer-scheduling e2e |
+| `c078d1c` | Vitest and source-map-js dependency updates |
+| `2f8dd3a` | Boundary-batched background completion delivery |
+| `e819a82` | Package-provided agents and workflows |
+| `83be963` | Activation-owned widget/group shutdown disposal |
+| `7e7d168` | 0.22.0 release |
+| `85a704c` | Development guidance |
+| `a6ad702`, `bd5980a` | Usage/disposed events and documentation |
+| `a1fc409` | Cross-extension RPC steering |
+| `d7c9ec0`, `ca93a52` | Resumed-run budgets, turn counting and stoppability |
+
+## Validation
+
+Executed on Node 24.19.0 and Pi 1.1.0 with a disposable writable Pi directory:
+
+| Check | Result |
+|---|---|
+| `npm ci --ignore-scripts --no-audit --no-fund` | Passed; 219 packages installed |
+| `npm run check` | Lint and typecheck passed; 127 test files, 2,506 tests passed, 7 skipped |
+| `npm run test:e2e` | 19 files, 95 tests passed, 7 skipped |
+| `npm run build` | Passed |
+| `git diff --check` | Passed |
+
+The end-to-end selection is included in the full suite, not additional coverage.
+The seven skips are opt-in live-model cases. Vite's future config-loader warning
+and Node's existing `fs.existsSync` deprecation warning remain non-failing.
+Scripted providers exercise real Pi sessions without paid model calls.
+The compaction regression checks saved, unread results while the parent is
+blocked and full model retrieval after the new boundary, rather than expecting
+the outbox to enqueue into Pi early. Existing model routing, real-Git failure,
+resume lifecycle, ownership, notification and shutdown tests remain included.
+Live-provider and manual Windows/macOS TUI behavior are not certified here.
+
+## Previous sync — 0.20.0-ahggg.1
+
+The following records the earlier integration and its validation.
 
 Sync target: [`tintinweb/pi-subagents@7d83085`](https://github.com/tintinweb/pi-subagents/commit/7d83085).
 Fork starting point: [`AHGGG/pi-subagents@c3e8d6c`](https://github.com/AHGGG/pi-subagents/commit/c3e8d6c).

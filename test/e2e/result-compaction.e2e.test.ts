@@ -2,7 +2,9 @@ import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi
 import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { NOTIFICATION_HOLD_MS } from "../../src/completion-outbox.js";
 import subagents from "../../src/index.js";
+import { findSavedResult } from "../../src/result-history.js";
 import { hermeticDir } from "../helpers/boot-extension.js";
 import { fauxModelBackend } from "../helpers/faux-model-backend.js";
 import { modelContext, registerFauxProvider } from "../helpers/pi-ai.js";
@@ -168,20 +170,37 @@ describe("actual extension results across parent auto-compaction", () => {
     await compactEntered.promise;
     expect(registry().getRecord(aId)?.status).toBe("running");
     expect(registry().getRecord(bId)?.status).toBe("running");
-    if (timing === "during-compaction") {
-      aRelease.resolve();
-      await vi.waitFor(() => expect(JSON.stringify(session!.agent.peekQueuedMessages())).toContain("A-PREVIEW-"), { timeout: 5000, interval: 10 });
-      compactRelease.resolve(); await toolEntered.promise;
-    } else {
+    if (timing === "after-compaction-tool") {
       compactRelease.resolve(); await toolEntered.promise;
       expect(compactCount).toBe(1);
-      aRelease.resolve();
-      await vi.waitFor(() => expect(JSON.stringify(session!.agent.peekQueuedMessages())).toContain("A-PREVIEW-"), { timeout: 5000, interval: 10 });
+    }
+    aRelease.resolve();
+    // Completion is finalized and recoverable while the parent is blocked.
+    // The outbox keeps its notice until turn_end rather than handing it to
+    // Pi's steering queue during compaction or a still-running tool batch.
+    await vi.waitFor(() => {
+      expect(registry().getRecord(aId)).toMatchObject({ status: "completed", runSettled: true, result: FULL_A });
+      expect(registry().getRecord(aId)?.resultConsumed).toBeFalsy();
+      expect(findSavedResult(sm.getBranch(), aId, session!.sessionId)).toMatchObject({
+        kind: "found", result: { id: aId, status: "completed", result: FULL_A, legacy: false },
+      });
+    }, { timeout: 5000, interval: 10 });
+    // Let the idle hold expire while the parent is still blocked: a notice
+    // must remain in the outbox until this busy parent's next turn boundary.
+    await new Promise(resolve => setTimeout(resolve, NOTIFICATION_HOLD_MS + 50));
+    expect(JSON.stringify(session.agent.peekQueuedMessages())).not.toContain("A-PREVIEW-");
+    expect(JSON.stringify(requests)).not.toContain("A-PREVIEW-");
+    expect(parentPhase).toBe(timing === "during-compaction" ? 2 : 3);
+    if (timing === "during-compaction") {
+      compactRelease.resolve(); await toolEntered.promise;
     }
     expect(registry().getRecord(bId)?.status).toBe("running");
     toolRelease.resolve(); await running;
     expect(compactCount).toBe(1);
     expect(sm.getBranch().some(e => e.type === "compaction")).toBe(true);
+    expect(findSavedResult(sm.getBranch(), aId, session.sessionId)).toMatchObject({
+      kind: "found", result: { id: aId, result: FULL_A, legacy: false },
+    });
     expect(registry().getRecord(aId)?.resultConsumed).toBe(true);
     expect(registry().getRecord(bId)?.status).toBe("running");
     expect(JSON.stringify(requests.at(-1))).toContain("A-SECRET-BEYOND-PREVIEW");

@@ -19,9 +19,11 @@ import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, serializeAgentFile } from "./agent-file-toggle.js";
 import { AgentManager, isTopLevelAgent } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
+import { rowDescription, sourceIndicator, sourceLegend } from "./agent-source-badge.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
 import { COMPLETION_DELIVERY_OPTIONS } from "./completion-delivery.js";
+import { CompletionOutbox } from "./completion-outbox.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { GroupJoinManager } from "./group-join.js";
@@ -32,6 +34,7 @@ import { describeModel, type ModelRegistry, resolveModel } from "./model-resolve
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
+import { getPackageAgentsGate, getPackageWorkflowsGate, invalidatePackageCache, packageNameForPath, seedProjectTrust, setPackageAgentsGate, setPackageWorkflowsGate, setProjectTrusted } from "./package-resources.js";
 import { findSavedResult, formatSavedResult, RESULT_ENTRY, RUN_START_ENTRY, snapshotRun } from "./result-history.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
@@ -393,11 +396,21 @@ export default function (pi: ExtensionAPI) {
       "Use the `=` form — the space form consumes the next argument, which would swallow a following prompt.",
   });
 
-  // Read directly rather than waiting for applyAndEmitLoaded below: this decides
+  // Read directly rather than waiting for applyAndEmitLoaded below: these decide
   // the initial load, which happens hundreds of lines before settings are applied.
-  let strictAgentFiles = loadSettings(process.cwd()).strictAgentFiles === true;
+  const bootSettings = loadSettings(process.cwd());
+  let strictAgentFiles = bootSettings.strictAgentFiles === true;
 
-  /** Reload agents from project/global custom agent dirs and merge with defaults (called on init and each Agent invocation). */
+  // Seed the package gates from the same merged settings, before the first load
+  // below reads them. `applyAndEmitLoaded` sets them again through the appliers;
+  // doing it here as well is what makes the *initial* registry honour them.
+  setPackageAgentsGate(bootSettings.packageAgents);
+  setPackageWorkflowsGate(bootSettings.packageWorkflows);
+  // And seed project trust from pi's saved decision, because the initial load is
+  // the one the `Agent` tool description is built from — see `seedProjectTrust`.
+  seedProjectTrust(process.cwd());
+
+  /** Reload agents from package/global/project agent dirs and merge with defaults (called on init and each Agent invocation). */
   const reloadCustomAgents = (strict = false) => {
     const userAgents = loadCustomAgents(process.cwd(), strict);
     registerAgents(userAgents);
@@ -449,29 +462,22 @@ export default function (pi: ExtensionAPI) {
   }
   const pendingUsage = new PendingUsagePool();
 
-  // ---- Cancellable pending notifications ----
-  // Holds notifications briefly so get_subagent_result can cancel them
-  // before they reach pi.sendMessage (fire-and-forget).
+  // ---- Completion delivery ----
+  // The outbox batches completions at the parent's next boundary, or after a
+  // short idle hold. The fork's delivery options still wake an idle parent.
   let shuttingDown = false;
-  const pendingNudges = new Map<string, ReturnType<typeof setTimeout>>();
-  const NUDGE_HOLD_MS = 200;
-
-  function scheduleNudge(key: string, send: () => void, delay = NUDGE_HOLD_MS) {
-    if (shuttingDown) return;
-    cancelNudge(key);
-    pendingNudges.set(key, setTimeout(() => {
-      pendingNudges.delete(key);
-      try { send(); } catch { /* ignore stale completion side-effect errors */ }
-    }, delay));
-  }
-
-  function cancelNudge(key: string) {
-    const timer = pendingNudges.get(key);
-    if (timer != null) {
-      clearTimeout(timer);
-      pendingNudges.delete(key);
-    }
-  }
+  const outbox = new CompletionOutbox(
+    (message) => {
+      if (shuttingDown) return;
+      pi.sendMessage<NotificationDetails>({
+        customType: "subagent-notification",
+        content: message.content,
+        display: true,
+        details: message.details,
+      }, COMPLETION_DELIVERY_OPTIONS);
+    },
+    () => currentCtx?.signal !== undefined,
+  );
 
   // Retained completions are snapshots, not mutable records for resumed runs.
   // Promise identity distinguishes executions even when timestamps coincide.
@@ -485,31 +491,27 @@ export default function (pi: ExtensionAPI) {
       && live.completedAt === completion.completedAt;
   }
 
-  // ---- Individual nudge helper (async join mode) ----
-  function emitIndividualNudge(record: AgentRecord) {
-    if (!isUnreadCompletion(record)) return; // Re-check consumption and execution.
-
-    const notification = formatTaskNotification(record, 500, showCost);
-    const footer = record.outputFile ? `\nFull transcript available at: ${record.outputFile}` : '';
-
-    pi.sendMessage<NotificationDetails>({
-      customType: "subagent-notification",
-      content: notification + footer + "\nResult ready. Retrieve full output with get_subagent_result({ agent_id: " + JSON.stringify(record.id) + ", wait: false }). This notice does not mean the result has been consumed.",
-      display: true,
-      details: buildNotificationDetails(record, 500, agentActivity.get(record.id)),
-    }, COMPLETION_DELIVERY_OPTIONS);
-  }
-
   function sendIndividualNudge(record: AgentRecord) {
+    if (!isUnreadCompletion(record)) return;
+    const activity = agentActivity.get(record.id);
     agentActivity.delete(record.id);
     widget.markFinished(record.id);
     fleet.onAgentFinished(record.id);
     const completion = { ...record };
-    scheduleNudge(record.id, () => emitIndividualNudge(completion));
+    // Built now, so a resume before the send cannot rewrite it. A record that
+    // cannot be formatted is skipped, as a failed send always was.
+    try {
+      const footer = record.outputFile ? `\nFull transcript available at: ${record.outputFile}` : '';
+      const message = {
+        content: formatTaskNotification(record, 500, showCost) + footer + "\nResult ready. Retrieve full output with get_subagent_result({ agent_id: " + JSON.stringify(record.id) + ", wait: false }). This notice does not mean the result has been consumed.",
+        details: buildNotificationDetails(record, 500, activity),
+      };
+      outbox.add({ ids: [record.id], build: () => isUnreadCompletion(completion) ? message : undefined });
+    } catch { /* ignore stale completion side-effect errors */ }
     widget.update();
   }
 
-  // ---- Group join manager ----
+  // ---- Group join manager (explicit `smart` and `group` join modes) ----
   const groupJoin = new GroupJoinManager(
     (records, partial) => {
       for (const r of records) {
@@ -520,30 +522,32 @@ export default function (pi: ExtensionAPI) {
         fleet.onAgentFinished(r.id);
       }
 
-      const groupKey = `group:${records.map(r => r.id).join(",")}`;
-      scheduleNudge(groupKey, () => {
-        // Re-check at send time
-        const unconsumed = records.filter(isUnreadCompletion);
-        if (unconsumed.length === 0) { widget.update(); return; }
-
-        const notifications = unconsumed.map(r => formatTaskNotification(r, 300, showCost)).join('\n\n');
-        const label = partial
-          ? `${unconsumed.length} agent(s) finished (partial — others still running)`
-          : `${unconsumed.length} agent(s) finished`;
-
-        const [first, ...rest] = unconsumed;
-        const details = buildNotificationDetails(first, 300, agentActivity.get(first.id));
-        if (rest.length > 0) {
-          details.others = rest.map(r => buildNotificationDetails(r, 300, agentActivity.get(r.id)));
-        }
-
-        pi.sendMessage<NotificationDetails>({
-          customType: "subagent-notification",
-          content: `Background agent group completed: ${label}\n\n${notifications}\n\nUse get_subagent_result for full output.`,
-          display: true,
-          details,
-        }, COMPLETION_DELIVERY_OPTIONS);
+      const members = records.filter(isUnreadCompletion).flatMap(r => {
+        try {
+          return [{ id: r.id, completion: { ...r }, text: formatTaskNotification(r, 300, showCost), details: buildNotificationDetails(r, 300, agentActivity.get(r.id)) }];
+        } catch { return []; /* as in sendIndividualNudge */ }
       });
+      if (members.length > 0) {
+        outbox.add({
+          ids: members.map(m => m.id),
+          build: (ids) => {
+            const unread = members.filter(m => ids.includes(m.id) && isUnreadCompletion(m.completion));
+            if (unread.length === 0) return undefined;
+            const notifications = unread.map(m => m.text).join('\n\n');
+            const label = partial
+              ? `${unread.length} agent(s) finished (partial — others still running)`
+              : `${unread.length} agent(s) finished`;
+
+            const [first, ...rest] = unread;
+            const details = { ...first.details };
+            if (rest.length > 0) details.others = rest.map(m => m.details);
+            return {
+              content: `Background agent group completed: ${label}\n\n${notifications}\n\nUse get_subagent_result for full output.`,
+              details,
+            };
+          },
+        });
+      }
       widget.update();
     },
     30_000,
@@ -616,9 +620,9 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // If this agent is pending batch finalization (debounce window still open),
-    // don't send an individual nudge — finalizeBatch will pick it up retroactively.
-    if (currentBatchAgents.some(a => a.id === record.id)) {
+    // A `group` spawn whose turn has not ended yet: its group is registered at
+    // that turn's end, which picks this completion up retroactively.
+    if (turnGroupSpawns.includes(record.id)) {
       widget.update();
       return;
     }
@@ -657,12 +661,48 @@ export default function (pi: ExtensionAPI) {
       tokensBefore: info.tokensBefore,
       compactionCount: record.compactionCount,
     });
-  }, (_record, usage) => {
+  }, (record, usage) => {
     // Every assistant message from every agent — nested included, exactly once.
     // Parked here until a tool result can carry it back to the parent session;
     // see `PendingUsagePool`. Skipped entirely when the feature is off, so no
     // pool grows in a session that will never drain it.
     if (reportUsage) pendingUsage.add(usage);
+    // The same message, live, for anyone keeping their own ledger — a footer
+    // that breaks spend down by agent type and thinking level, say. This is the
+    // one place every agent's spend passes through, which is why it is emitted
+    // here and not from the lifecycle events: those fire for top-level agents
+    // only, once, at the end, so a workflow's children and nested agents would
+    // never be counted, and a running agent would read as free until it
+    // stopped. Deliberately ungated by `reportUsage` — that decides whether the
+    // parent session's own totals include this spend, not whether it happened.
+    //
+    // `model` and `thinking` are read off the record per message, not captured
+    // at spawn: the record is authoritative only once the session exists and pi
+    // has clamped the level to the model (see `onSessionCreated`).
+    const reported = toReportedUsage(usage);
+    if (!reported) return;
+    // A key whose value is unknown is omitted, never `undefined`: `model` and
+    // `thinking` until the session has reported them, `parentAgentId` and
+    // `workflowId` on a top-level agent.
+    const invocation = record.invocation;
+    pi.events.emit("subagents:usage", {
+      id: record.id,
+      type: record.type,
+      description: record.description,
+      ...(invocation?.modelId !== undefined ? { model: invocation.modelId } : {}),
+      ...(invocation?.thinking !== undefined ? { thinking: invocation.thinking } : {}),
+      // Set only when the caller did not get the level it asked for (pi
+      // clamped it to the model, or an agent file outranked it), so a ledger
+      // can show `low (asked minimal)` instead of silently relabelling.
+      ...(invocation?.requestedThinking !== undefined ? { requestedThinking: invocation.requestedThinking } : {}),
+      depth: record.depth ?? 1,
+      ...(record.parentAgentId !== undefined ? { parentAgentId: record.parentAgentId } : {}),
+      ...(record.workflowId !== undefined ? { workflowId: record.workflowId } : {}),
+      usage: reported,
+    });
+  }, (record, message) => {
+    if (!isTopLevelAgent(record)) return;
+    pi.events.emit("subagents:steered", { id: record.id, message });
   });
 
   // Expose manager via Symbol.for() global registry for cross-package access.
@@ -771,7 +811,11 @@ export default function (pi: ExtensionAPI) {
   // --- Cross-extension RPC via pi.events ---
   let currentCtx: ExtensionContext | undefined;
   manager.setRunObserver(record => {
-    if (shuttingDown || !currentCtx || !isTopLevelAgent(record)) return;
+    if (shuttingDown || !isTopLevelAgent(record)) return;
+    // Acceptance invalidates a prior run before a queued/foreground resume
+    // can wait. The build-time generation check covers every later boundary.
+    if (!record.runSettled) outbox.cancel(record.id);
+    if (!currentCtx) return;
     const sessionId = currentCtx.sessionManager.getSessionId();
     if (record.rootSessionId !== undefined && record.rootSessionId !== sessionId) {
       console.warn("[pi-subagents] Refusing to record an execution in a different parent session: " + record.id);
@@ -818,6 +862,15 @@ export default function (pi: ExtensionAPI) {
   // bound session_start, so a filtered-out activation never advertises (#142).
   pi.on("session_start", async (_event, ctx) => {
     currentCtx = ctx;
+    // Pi resolves project trust before the first session starts, so this is the
+    // earliest honest answer. The activation-time load defaulted to untrusted,
+    // so a trusted project's `packages[]` only becomes visible now.
+    setProjectTrusted(ctx.isProjectTrusted?.() === true);
+    // Unconditional, and not folded into the call above: `/reload` and a new or
+    // resumed session all land here, and any of them may follow a `pi install`
+    // that added a package the cached root list predates.
+    invalidatePackageCache();
+    reloadCustomAgents();
     if (ctx.hasUI) {
       widget.setUICtx(ctx.ui);
       fleet.setUICtx(ctx.ui as any);
@@ -847,9 +900,10 @@ export default function (pi: ExtensionAPI) {
             if (!record || record.parentAgentId) return false;
             if (manager.isRunPending(record)) return false;
             record.resultConsumed = true;
-            cancelNudge(record.id);
+            outbox.cancel(record.id);
             return true;
           },
+          steer: (id, message) => manager.steer(id, message),
         },
       });
       // Broadcast readiness so extensions loaded alongside us can discover us.
@@ -950,7 +1004,6 @@ export default function (pi: ExtensionAPI) {
         // this message is still relayed even if the LLM read its last answer.
         record.resultConsumed = false;
         manager.steer(record.id, mention.message);
-        pi.events.emit("subagents:steered", { id: record.id, message: mention.message });
         ctx.ui.notify(`Sent to ${target}`, "info");
         return { action: "handled" };
       }
@@ -960,10 +1013,9 @@ export default function (pi: ExtensionAPI) {
         // agent, so its frontmatter is what governs — `output_transcript: false`
         // must keep holding, since record.outputFile is the sole gate every
         // downstream consumer keys off and a resume must not re-open it.
-        const config = getAgentConfig(record.type);
         const resumedRecord = await startBackgroundResume(ctx, record, mention.message, {
-          outputTranscript: config?.outputTranscript ?? getOutputTranscriptDefault(),
-          maxTurns: normalizeMaxTurns(config?.maxTurns ?? getDefaultMaxTurns()),
+          outputTranscript: getAgentConfig(record.type)?.outputTranscript ?? getOutputTranscriptDefault(),
+          maxTurns: resumeTurnLimit(record),
         });
         ctx.ui.notify(
           resumedRecord ? `Resuming ${target}` : `Could not resume ${target} — it is still running.`,
@@ -1131,6 +1183,7 @@ export default function (pi: ExtensionAPI) {
     rpcHandle?.unsubStop();
     rpcHandle?.unsubPing();
     rpcHandle?.unsubConsume();
+    rpcHandle?.unsubSteer();
     rpcHandle = undefined;
     currentCtx = undefined;
     // Only release the global slot if this activation claimed it — a child
@@ -1144,21 +1197,16 @@ export default function (pi: ExtensionAPI) {
     for (const task of workflowTasks.values()) task.abortController.abort();
     workflowTasks.clear();
     manager.abortAll();
-    for (const timer of pendingNudges.values()) clearTimeout(timer);
-    pendingNudges.clear();
-    // Activation-owned timers/UI (#256): the Node process survives reload and
-    // session replacement, so a pending batch debounce, group-join timeout, or
-    // widget render interval from this activation can fire into the next one.
-    // Clear the debounce first — a late finalizeBatch would otherwise schedule
-    // fresh nudges and register stale groups through the paths above — then the
-    // group-join timeouts, then the widget, all before the fleet/manager teardown.
-    if (batchFinalizeTimer) {
-      clearTimeout(batchFinalizeTimer);
-      batchFinalizeTimer = undefined;
-    }
-    currentBatchAgents = [];
+    // Activation-owned UI and group state (#256): `session_shutdown` also runs for
+    // reload and session replacement, where the Node process survives, so a live
+    // widget render interval or a pending group-join timeout from this activation
+    // would outlive it and fire into the next session's UI and group state.
+    // `session_before_switch` deliberately keeps both: a vetoed switch continues
+    // this session, where the live UI and group state must survive.
+    turnGroupSpawns = [];
     groupJoin.dispose();
     widget.dispose();
+    outbox.dispose();
     fleet.dispose();
     unsubHandoffKey?.();
     unsubHandoffKey = undefined;
@@ -1168,6 +1216,13 @@ export default function (pi: ExtensionAPI) {
     // pi awaits this handler, and the process exits right after — unawaited, those
     // handlers would never run. Internally bounded, so a hung one can't strand quit.
     await manager.dispose(pi);
+    // Every agent is stopped and every child session has shut down, so no more
+    // `subagents:usage` can arrive. A ledger flushing in its own
+    // `session_shutdown` may have run before this handler aborted the agents
+    // (handlers run in load order) and missed their last messages; this is the
+    // point after which a synchronous final flush is complete. Synchronous:
+    // `emit` does not await listeners, and pi exits once this handler returns.
+    pi.events.emit("subagents:disposed", {});
   });
 
   // Live widget: show running agents above editor.
@@ -1352,50 +1407,56 @@ export default function (pi: ExtensionAPI) {
   function getToolDescriptionMode(): ToolDescriptionMode { return toolDescriptionMode; }
   function setToolDescriptionMode(mode: ToolDescriptionMode): void { toolDescriptionMode = mode; }
 
-  // ---- Batch tracking for smart join mode ----
-  // Collects background agent IDs spawned in the current turn for smart grouping.
-  // Uses a debounced timer: each new agent resets the 100ms window so that all
-  // parallel tool calls (which may be dispatched across multiple microtasks by the
-  // framework) are captured in the same batch.
-  let currentBatchAgents: { id: string; joinMode: JoinMode }[] = [];
-  let batchFinalizeTimer: ReturnType<typeof setTimeout> | undefined;
-  let batchCounter = 0;
+  // ---- Turn batches for explicit `smart` and `group` join modes ----
+  // Background spawns the parent made in its current turn. The turn's end is
+  // the batch boundary: every `Agent` call of the batch has returned by then,
+  // so a spawn whose startup failed has already thrown and was never recorded,
+  // and a slow worktree copy cannot split the batch.
+  let turnGroupSpawns: string[] = [];
+  let turnGroupCounter = 0;
 
-  /** Finalize the current batch: if 2+ smart-mode agents, register as a group. */
-  function finalizeBatch() {
-    batchFinalizeTimer = undefined;
-    const batchAgents = [...currentBatchAgents];
-    currentBatchAgents = [];
+  /** Record a grouped spawn made inside a parent turn. */
+  function joinTurnGroup(id: string, joinMode: JoinMode | undefined) {
+    // Outside a parent turn (an `@handle` mention) no turn end is coming, and a
+    // group of one is delivered exactly like a single completion.
+    if ((joinMode === 'smart' || joinMode === 'group') && currentCtx?.signal !== undefined) turnGroupSpawns.push(id);
+  }
 
-    const smartAgents = batchAgents.filter(a => a.joinMode === 'smart' || a.joinMode === 'group');
-    if (smartAgents.length >= 2) {
-      const groupId = `batch-${++batchCounter}`;
-      const ids = smartAgents.map(a => a.id);
-      groupJoin.registerGroup(groupId, ids);
-      // Retroactively process agents that already completed during the debounce window.
-      // Their onComplete fired but was deferred (agent was in currentBatchAgents),
-      // so we feed them into the group now.
-      for (const id of ids) {
-        const record = manager.getRecord(id);
-        if (!record) continue;
-        // Fast runs can settle during awaitStartup, before batch registration.
-        // The group now owns delivery: retract the individual hold first.
-        cancelNudge(id);
-        record.groupId = groupId;
-        if (record.completedAt != null && !record.resultConsumed) {
-          groupJoin.onAgentComplete(record);
-        }
-      }
-    } else {
-      // No group formed — send individual nudges for any agents that completed
-      // during the debounce window and had their notification deferred.
-      for (const { id } of batchAgents) {
-        const record = manager.getRecord(id);
-        if (record?.completedAt != null && !record.resultConsumed) {
-          sendIndividualNudge(record);
-        }
+  /** Register the ending turn's grouped spawns, two or more, as one group. */
+  function registerTurnGroup() {
+    const ids = [...new Set(turnGroupSpawns)];
+    turnGroupSpawns = [];
+    // One spawn is no group: it reports like any single completion.
+    if (ids.length < 2) {
+      const record = ids.length === 1 ? manager.getRecord(ids[0]) : undefined;
+      if (record?.completedAt != null && !record.resultConsumed) sendIndividualNudge(record);
+      return;
+    }
+    const groupId = `turn-${++turnGroupCounter}`;
+    groupJoin.registerGroup(groupId, ids);
+    // Members that finished before their turn ended had their completion
+    // deferred (see the manager's onComplete); feed them in now.
+    for (const id of ids) {
+      const record = manager.getRecord(id);
+      if (!record) continue;
+      // A run can finish during awaitStartup, before group registration.
+      // The group owns delivery now, so retract any earlier individual hold.
+      outbox.cancel(id);
+      record.groupId = groupId;
+      if (record.completedAt != null && isUnreadCompletion(record)) {
+        groupJoin.onAgentComplete(record);
       }
     }
+  }
+
+  /**
+   * The turn budget for resuming `record`, from its OWN type — resume ignores
+   * `subagent_type`. Same precedence as a spawn, frontmatter authoritative:
+   * the agent file's `max_turns`, else the call's, else the limit the agent
+   * was spawned with, else the default (#368).
+   */
+  function resumeTurnLimit(record: AgentRecord, explicit?: number): number | undefined {
+    return normalizeMaxTurns(getAgentConfig(record.type)?.maxTurns ?? explicit ?? record.invocation?.maxTurns ?? getDefaultMaxTurns());
   }
 
   /**
@@ -1447,6 +1508,8 @@ export default function (pi: ExtensionAPI) {
     // run_in_background in that same turn keep going.
     const record = await manager.resume(id, prompt, undefined, {
       isBackground: true,
+      maxTurns: opts.maxTurns,
+      onTurnEnd: bgCallbacks.onTurnEnd,
       onToolActivity: bgCallbacks.onToolActivity,
       onAssistantUsage: bgCallbacks.onAssistantUsage,
       // Fires when the run actually starts — immediately, or on queue
@@ -1462,11 +1525,8 @@ export default function (pi: ExtensionAPI) {
     });
     if (!record) return undefined;
 
-    if (joinMode != null && joinMode !== 'async') {
-      currentBatchAgents.push({ id, joinMode });
-      if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
-      batchFinalizeTimer = setTimeout(finalizeBatch, 100);
-    }
+    // Only a resume from an Agent call belongs to that call's turn.
+    if (opts.toolCallId !== undefined) joinTurnGroup(id, joinMode);
 
     agentActivity.set(id, bgState);
     // This agent already finished once, so the widget holds a finished-age
@@ -1499,6 +1559,15 @@ export default function (pi: ExtensionAPI) {
     watchHandoffKey(ctx.ui);
     widget.onTurnStart();
   });
+
+  // The parent's tool batch is done and its next model call not yet made: the
+  // boundary where completions are delivered, as in Claude Code.
+  pi.on("turn_end", (event) => {
+    registerTurnGroup();
+    outbox.onTurnEnd(event.message.role === "assistant" ? event.message.stopReason : undefined);
+  });
+  pi.on("agent_end", () => outbox.onAgentEnd());
+  pi.on("agent_settled", () => outbox.onAgentEnd());
 
   /** Build the full type list text dynamically from available agents only. */
   const buildTypeListText = () => {
@@ -1562,6 +1631,8 @@ export default function (pi: ExtensionAPI) {
       setShowCost,
       setShowModel,
       setViewerMarkdown,
+      setPackageAgents: setPackageAgentsGate,
+      setPackageWorkflows: setPackageWorkflowsGate,
     },
     (event, payload) => pi.events.emit(event, payload),
   );
@@ -1769,7 +1840,7 @@ Background completion notices reach your next model request after the current to
       ),
       resume: Type.Optional(
         Type.String({
-          description: "Optional agent ID to resume from, as reported on the `Agent ID:` line of any spawn or resume result. Continues from previous context. Resumes detached like any other spawn; pass run_in_background: false to block and get the result inline. An agent can only be resumed once its current run has finished — use steer_subagent to reach one mid-run.",
+          description: "Optional agent ID to resume from, as reported on the `Agent ID:` line of any spawn or resume result. Continues from previous context. The resumed run gets a fresh max_turns budget. Resumes detached like any other spawn; pass run_in_background: false to block and get the result inline. An agent can only be resumed once its current run has finished — use steer_subagent to reach one mid-run.",
         }),
       ),
       isolated: Type.Optional(
@@ -2125,6 +2196,9 @@ Background completion notices reach your next model request after the current to
         if (!existing.session) {
           return textResult(`Agent "${params.resume}" has no active session to resume.`);
         }
+        // Not `effectiveMaxTurns`: that was resolved for `subagent_type`, which
+        // a resume ignores, so it may describe another agent.
+        const resumeMaxTurns = resumeTurnLimit(existing, params.max_turns);
 
         // Background resume: detached run that notifies on completion, mirroring
         // a background spawn. Previously run_in_background was silently ignored
@@ -2146,7 +2220,7 @@ Background completion notices reach your next model request after the current to
 
           const record = await startBackgroundResume(ctx, existing, params.prompt, {
             outputTranscript,
-            maxTurns: effectiveMaxTurns,
+            maxTurns: resumeMaxTurns,
             toolCallId,
           });
           if (!record) {
@@ -2166,7 +2240,28 @@ Background completion notices reach your next model request after the current to
           );
         }
 
-        const record = await manager.resume(params.resume, params.prompt, signal);
+        // Tracked like a foreground spawn, so the widget row and the result
+        // card show THIS run's `↻N≤M` and tool activity rather than the
+        // previous run's. The session predates this run, so it is seeded here.
+        const { state: resumeState, callbacks: resumeCallbacks } = createActivityTracker(resumeMaxTurns);
+        resumeState.session = existing.session;
+        agentActivity.set(existing.id, resumeState);
+        widget.markRunning(existing.id);
+        widget.ensureTimer();
+        fleet.ensureTimer();
+        fleet.update();
+        let record: AgentRecord | undefined;
+        try {
+          record = await manager.resume(params.resume, params.prompt, signal, {
+            maxTurns: resumeMaxTurns,
+            onTurnEnd: resumeCallbacks.onTurnEnd,
+            onToolActivity: resumeCallbacks.onToolActivity,
+          });
+        } finally {
+          agentActivity.delete(existing.id);
+          widget.markFinished(existing.id);
+          fleet.onAgentFinished(existing.id);
+        }
         if (!record) {
           return textResult(`Failed to resume agent "${params.resume}".`);
         }
@@ -2175,12 +2270,12 @@ Background completion notices reach your next model request after the current to
         if (record.status === "error") {
           return textResult(
             `Agent failed: ${record.error}\nAgent ID: ${record.id}${partialOutputSuffix(record)}`,
-            buildDetails(detailBaseFor(record), record),
+            buildDetails(detailBaseFor(record), record, resumeState),
           );
         }
         return textResult(
           `Agent ID: ${record.id}\n\n${record.result?.trim() || "No output."}`,
-          buildDetails(detailBaseFor(record), record),
+          buildDetails(detailBaseFor(record), record, resumeState),
         );
       }
 
@@ -2254,16 +2349,7 @@ Background completion notices reach your next model request after the current to
         // call instead of being reported as a subagent that ran (#179).
         await manager.awaitStartup(id);
 
-        if (joinMode == null || joinMode === 'async') {
-          // Foreground/no join mode or explicit async — not part of any batch
-        } else {
-          // smart or group — add to current batch
-          currentBatchAgents.push({ id, joinMode });
-          // Debounce: reset timer on each new agent so parallel tool calls
-          // dispatched across multiple event loop ticks are captured together
-          if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
-          batchFinalizeTimer = setTimeout(finalizeBatch, 100);
-        }
+        joinTurnGroup(id, joinMode);
 
         agentActivity.set(id, bgState);
         widget.ensureTimer();
@@ -2575,34 +2661,30 @@ Background completion notices reach your next model request after the current to
 
   /**
    * Hand a finished run back to the model through the SAME channel a background
-   * agent uses — held briefly by `scheduleNudge`, delivered as a steering
-   * message that triggers a turn, rendered by the existing
-   * `subagent-notification` renderer.
+   * agent uses — the completion outbox, which delivers at the parent's next
+   * boundary — rendered by the existing `subagent-notification` renderer.
    */
   function notifyWorkflowFinished(task: WorkflowTask) {
     if (shuttingDown || !workflowTasks.has(task.id)) return;
     widget.update();
     fleet.update();
     const result = workflowResultText(task);
-    scheduleNudge(task.id, () => {
-      pi.sendMessage<NotificationDetails>({
-        customType: "subagent-notification",
-        content: formatWorkflowNotification(task),
-        display: true,
-        details: {
-          id: task.id,
-          description: `Workflow ${task.workflowName ?? task.id}`,
-          status: task.status === "completed" ? "completed" : task.status === "killed" ? "stopped" : "error",
-          toolUses: task.totalToolCalls,
-          // A workflow has agents, not turns; rendering "↻0" would be noise.
-          turnCount: 0,
-          totalTokens: task.totalTokens,
-          durationMs: elapsedMs(task, Date.now()),
-          error: task.error,
-          resultPreview: result.length > 500 ? `${result.slice(0, 500)}…` : result,
-        },
-      }, COMPLETION_DELIVERY_OPTIONS);
-    });
+    const message = {
+      content: formatWorkflowNotification(task),
+      details: {
+        id: task.id,
+        description: `Workflow ${task.workflowName ?? task.id}`,
+        status: task.status === "completed" ? "completed" : task.status === "killed" ? "stopped" : "error",
+        toolUses: task.totalToolCalls,
+        // A workflow has agents, not turns; rendering "↻0" would be noise.
+        turnCount: 0,
+        totalTokens: task.totalTokens,
+        durationMs: elapsedMs(task, Date.now()),
+        error: task.error,
+        resultPreview: result.length > 500 ? `${result.slice(0, 500)}…` : result,
+      },
+    };
+    outbox.add({ ids: [task.id], build: () => message });
   }
 
   // Defined unconditionally, registered only when the feature is on — the same
@@ -3008,7 +3090,7 @@ Background completion notices reach your next model request after the current to
       // Mark result as consumed — suppresses the completion notification
       if (!pending) {
         record.resultConsumed = true;
-        cancelNudge(record.id);
+        outbox.cancel(record.id);
       }
 
       // Verbose: include full conversation
@@ -3173,6 +3255,16 @@ Background completion notices reach your next model request after the current to
     }
   }
 
+  /**
+   * The package that provided an agent, for display only. Undefined for every
+   * other source, and for a package path no currently-admitted package owns —
+   * which is what a stale `sourcePath` looks like after the gate narrows.
+   */
+  function packageNameOf(cfg: AgentConfig | undefined): string | undefined {
+    if (cfg?.source !== "package" || !cfg.sourcePath) return undefined;
+    return packageNameForPath(cfg.sourcePath, process.cwd());
+  }
+
   async function showAllAgentsList(ctx: ExtensionCommandContext) {
     const allNames = getAllTypes();
     if (allNames.length === 0) {
@@ -3180,39 +3272,28 @@ Background completion notices reach your next model request after the current to
       return;
     }
 
-    // Source indicators: defaults unmarked, custom agents get • (project) or ◦ (global)
-    // Disabled agents get ✕ prefix
-    const sourceIndicator = (cfg: AgentConfig | undefined) => {
-      const disabled = cfg?.enabled === false;
-      if (cfg?.source === "project") return disabled ? "✕• " : "•  ";
-      if (cfg?.source === "global") return disabled ? "✕◦ " : "◦  ";
-      if (disabled) return "✕  ";
-      return "   ";
-    };
+    const configs = allNames.map(name => getAgentConfig(name));
 
     // One row per agent (name in the left column, model on the right); the
     // full description renders below the highlighted row via SettingsList,
     // exactly like the Settings menu — so long descriptions never wrap the list.
-    const items: SettingItem[] = allNames.map(name => {
-      const cfg = getAgentConfig(name);
-      const disabled = cfg?.enabled === false;
+    // A package agent's description is prefixed with the package that provided
+    // it: the `▪` badge says a package won, not which one.
+    const items: SettingItem[] = allNames.map((name, i) => {
+      const cfg = configs[i];
       const model = getModelLabel(name, ctx.modelRegistry, ctx.model?.provider);
       return {
         id: name,
         label: `${sourceIndicator(cfg)}${name}`,
         currentValue: model,
-        description: disabled ? "(disabled)" : (cfg?.description ?? name),
+        description: rowDescription(name, cfg, packageNameOf(cfg)),
         // Single-value list so Enter "activates" the row (fires onChange with the
         // agent's id) without offering anything to actually cycle.
         values: [model],
       };
     });
 
-    const hasCustom = allNames.some(n => { const c = getAgentConfig(n); return c && !c.isDefault && c.enabled !== false; });
-    const hasDisabled = allNames.some(n => getAgentConfig(n)?.enabled === false);
-    const legendParts: string[] = [];
-    if (hasCustom) legendParts.push("• = project  ◦ = global");
-    if (hasDisabled) legendParts.push("✕ = disabled");
+    const legend = sourceLegend(configs);
 
     const selected = await ctx.ui.custom<string | undefined>((_tui, _theme, _kb, done) => {
       const slTheme = getSettingsListTheme();
@@ -3225,7 +3306,7 @@ Background completion notices reach your next model request after the current to
       );
       const container = new Container();
       container.addChild(new Text("Agent types", 0, 0));
-      if (legendParts.length) container.addChild(new Text(slTheme.hint(legendParts.join("  ")), 0, 0));
+      if (legend) container.addChild(new Text(slTheme.hint(legend), 0, 0));
       container.addChild(new Spacer(1));
       container.addChild(list);
       return {
@@ -3297,12 +3378,23 @@ Background completion notices reach your next model request after the current to
       return;
     }
 
-    const file = locateAgentFile(name, cfg.sourcePath);
+    const isPackage = cfg.source === "package";
+    const file = locateAgentFile(name, cfg.sourcePath, undefined, cfg.source);
     const isDefault = cfg.isDefault === true;
     const disabled = cfg.enabled === false;
 
     let menuOptions: string[];
-    if (disabled && file) {
+    if (isPackage) {
+      // Read-only: nothing here may write inside pi's install root. `Disable`
+      // still appears because it writes a *local* stub that shadows the package
+      // agent, and `Enable` never does — a package agent that reads as disabled
+      // was disabled by its own author's `enabled: false`, which only the
+      // package can take back. Eject is the way out of that: the copy it writes
+      // carries no `enabled:` line, so the ejected agent is on.
+      menuOptions = disabled
+        ? ["Eject (export as .md)", "Back"]
+        : ["Eject (export as .md)", "Disable", "Back"];
+    } else if (disabled && file) {
       // Disabled agent with a file — offer Enable
       menuOptions = isDefault
         ? ["Enable", "Edit", "Reset to default", "Delete", "Back"]
@@ -3318,7 +3410,11 @@ Background completion notices reach your next model request after the current to
       menuOptions = ["Edit", "Disable", "Delete", "Back"];
     }
 
-    const choice = await ctx.ui.select(name, menuOptions);
+    // Name the package in the title: this menu's options are the read-only set,
+    // and "which package do I have to uninstall or allowlist away" is the
+    // question they raise.
+    const pkgName = packageNameOf(cfg);
+    const choice = await ctx.ui.select(pkgName ? `${name} — ${pkgName}` : name, menuOptions);
     if (!choice || choice === "Back") return;
 
     if (choice === "Edit" && file) {
@@ -3382,7 +3478,12 @@ Background completion notices reach your next model request after the current to
 
   /** Disable an agent: set enabled: false in its .md file, or create a stub for built-in defaults. */
   async function disableAgent(ctx: ExtensionCommandContext, name: string) {
-    const file = locateAgentFile(name, getAgentConfig(name)?.sourcePath);
+    const cfg = getAgentConfig(name);
+    // `locateAgentFile` refuses a package agent's own path, so this is either the
+    // local stub already shadowing it or nothing — never a file inside pi's
+    // install root. An unshadowed package agent therefore falls to the stub
+    // branch below, which writes `enabled: false` at project or personal scope.
+    const file = locateAgentFile(name, cfg?.sourcePath, undefined, cfg?.source);
     if (file) {
       // Existing file — set enabled: false in frontmatter (idempotent)
       const content = readFileSync(file.path, "utf-8");
@@ -3404,7 +3505,8 @@ Background completion notices reach your next model request after the current to
       return;
     }
 
-    // No file (built-in default) — create a stub
+    // No editable file (a built-in default, or a package-provided agent) —
+    // create a stub that shadows it.
     const location = await ctx.ui.select("Choose location", [
       "Project (.pi/agents/)",
       `Personal (${personalAgentsDir()})`,
@@ -3423,7 +3525,8 @@ Background completion notices reach your next model request after the current to
 
   /** Enable a disabled agent by removing enabled: false from its frontmatter. */
   async function enableAgent(ctx: ExtensionCommandContext, name: string) {
-    const file = locateAgentFile(name, getAgentConfig(name)?.sourcePath);
+    const cfg = getAgentConfig(name);
+    const file = locateAgentFile(name, cfg?.sourcePath, undefined, cfg?.source);
     if (!file) return;
 
     const content = readFileSync(file.path, "utf-8");
@@ -3684,6 +3787,8 @@ Write the file using the write tool. Only write the file, nothing else.`;
       showCost: isShowCostEnabled(),
       showModel: isShowModelEnabled(),
       viewerMarkdown: getViewerMarkdown(),
+      packageAgents: getPackageAgentsGate(),
+      packageWorkflows: getPackageWorkflowsGate(),
     } satisfies SubagentsSettings;
   }
 
@@ -3697,6 +3802,30 @@ Write the file using the write tool. Only write the file, nothing else.`;
       : ["snapshotSettings() is missing a SubagentsSettings key"];
   const _settingsSnapshotIsComplete: _NoMissingSettingsKeys = true;
   void _settingsSnapshotIsComplete;
+
+  /**
+   * Whether a package gate lets anything through. `undefined` is the unset
+   * default and reads as `true`; an empty allowlist matches nothing, like
+   * `false`.
+   */
+  function gateAdmitsAnything(gate: ReturnType<typeof getPackageAgentsGate>): boolean {
+    if (gate === undefined || gate === true) return true;
+    if (gate === false) return false;
+    return gate.length > 0;
+  }
+
+  /**
+   * Settings-row description for a package gate, naming the configured allowlist
+   * when there is one. The row itself is on/off — an allowlist is hand-written in
+   * `subagents.json` — so the description is the only place it is visible, and a
+   * user about to toggle the row can see what they are about to replace.
+   */
+  function describeGateSetting(gate: ReturnType<typeof getPackageAgentsGate>, base: string): string {
+    if (!Array.isArray(gate)) return base;
+    return gate.length > 0
+      ? `${base} Currently limited to: ${gate.join(", ")}.`
+      : `${base} Currently limited to an empty list, so nothing loads.`;
+  }
 
   const NUMERIC_IDS = new Set([
     "maxConcurrent", "maxConcurrentForeground", "defaultMaxTurns", "graceTurns", "maxSubagentDepth",
@@ -3756,9 +3885,9 @@ Write the file using the write tool. Only write the file, nothing else.`;
         {
           id: "joinMode",
           label: "Join mode",
-          description: "Default join mode for background agents",
+          description: "async = report each ready result at the next boundary; smart/group = wait for the turn's sibling agents",
           currentValue: getDefaultJoinMode(),
-          values: ["smart", "async", "group"],
+          values: ["async", "smart", "group"],
         },
         {
           id: "backgroundByDefault",
@@ -3781,6 +3910,28 @@ Write the file using the write tool. Only write the file, nothing else.`;
             "Scripted workflows, on unless another extension provides a workflow tool "
             + "(off keeps the SubagentWorkflow tool out of the tool spec; applies on next pi session)",
           currentValue: isWorkflowsEnabled() ? "on" : "off",
+          values: ["on", "off"],
+        },
+        {
+          id: "packageAgents",
+          label: "Package agents",
+          description: describeGateSetting(
+            getPackageAgentsGate(),
+            "Load agents declared by installed pi packages (`pi.subagents.agents` in their package.json). "
+            + "They rank below your global and project agents, so a same-named local file always wins.",
+          ),
+          currentValue: gateAdmitsAnything(getPackageAgentsGate()) ? "on" : "off",
+          values: ["on", "off"],
+        },
+        {
+          id: "packageWorkflows",
+          label: "Package workflows",
+          description: describeGateSetting(
+            getPackageWorkflowsGate(),
+            "Resolve saved workflow names against scripts declared by installed pi packages "
+            + "(`pi.subagents.workflows`). Searched last, after your project, workspace and personal directories.",
+          ),
+          currentValue: gateAdmitsAnything(getPackageWorkflowsGate()) ? "on" : "off",
           values: ["on", "off"],
         },
         {
@@ -4009,6 +4160,23 @@ Write the file using the write tool. Only write the file, nothing else.`;
           ctx,
           `Worktree isolation ${enabled ? "enabled" : "disabled"}. Tool parameter updates on next pi session.`,
         );
+      } else if (id === "packageAgents" || id === "packageWorkflows") {
+        const enabled = value === "on";
+        const isAgents = id === "packageAgents";
+        const previous = isAgents ? getPackageAgentsGate() : getPackageWorkflowsGate();
+        (isAgents ? setPackageAgentsGate : setPackageWorkflowsGate)(enabled);
+        reloadCustomAgents();
+        const label = isAgents ? "Package agents" : "Package workflows";
+        // An allowlist cannot be expressed by an on/off row, so say plainly that
+        // it is gone rather than letting a toggle quietly widen the gate.
+        const replaced = Array.isArray(previous) && previous.length > 0
+          ? ` Replaced the allowlist (${previous.join(", ")}) — re-add it in .pi/subagents.json to narrow it again.`
+          : "";
+        // Same caveat every row that changes the advertised agent set carries:
+        // the `Agent` tool's description and schema are built at registration,
+        // so until the next session the model is reading a stale type list.
+        const specNote = isAgents ? " Tool spec change takes effect on next pi session." : "";
+        notifyApplied(ctx, `${label} ${enabled ? "enabled" : "disabled"}.${replaced}${specNote}`);
       } else if (id === "toolDescriptionMode") {
         setToolDescriptionMode(value as ToolDescriptionMode);
         notifyApplied(ctx, `Tool description set to ${value}. Takes effect on next pi session.`);

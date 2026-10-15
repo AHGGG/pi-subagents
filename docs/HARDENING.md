@@ -1,6 +1,6 @@
 # Personal fork hardening
 
-Introduced in `0.19.0-ahggg.3`; retained in **0.20.0-ahggg.1**.
+Introduced in `0.19.0-ahggg.3`; retained in **0.22.0-ahggg.1**.
 See [upstream sync decisions](UPSTREAM_SYNC.md) for the Pi 1.1 integration.
 
 Install/update from Git:
@@ -70,6 +70,9 @@ The extension does not disable Git signing or overwrite existing branches.
 
 Automatic completion delivery remains steer + triggerTurn: true. Current tools
 finish before the notice is handled; an idle main agent can wake automatically.
+The outbox batches available notices at each parent boundary. Accepted resumes
+cancel pending notices from the previous run, and delivery rechecks execution
+identity and consumption. Saved-result recording still precedes notification.
 Stopping the parent alone does not cancel all detached children or permanently
 suppress their future notices. One-shot commands still need explicit joins before
 exit. Already-queued notices cannot be retracted, and notification exactly-once

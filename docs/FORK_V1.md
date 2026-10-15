@@ -1,8 +1,8 @@
 # AHGGG personal fork — installation and behavior
 
-Current version: **0.20.0-ahggg.1**.
+Current version: **0.22.0-ahggg.1**.
 
-Synced through upstream master `7d83085`, including changes after upstream 0.20.0.
+Synced through upstream master `ca93a52`, including changes after upstream 0.22.0.
 See [merge decisions](UPSTREAM_SYNC.md) for the imported changes and
 [hardening behavior](HARDENING.md) for retained saved-result recovery and lifecycle guarantees.
 Requires Pi **1.1.0 or newer**; development dependencies and the required CI baseline
@@ -28,8 +28,9 @@ is needed. Do not install the unpublished @ahggg/pi-subagents npm name.
 
 ## Completion contract
 
-Introduced in `0.19.0-ahggg.2` and retained in the current fork. Upstream #387 now
-uses the same delivery policy; the fork keeps one shared option constant.
+Introduced in `0.19.0-ahggg.2` and retained in the current fork. Upstream #388
+adds an outbox that combines available notices at each parent turn boundary;
+the fork keeps one shared delivery option constant and stale-run filtering.
 
 Individual, grouped and workflow-tool completions use the shared delivery options:
 
@@ -68,15 +69,19 @@ before finishing. Explicit waits remain unbounded.
 
 ## Existing controls and reliability
 
-The defaultJoinMode setting defaults to async, notifying each child independently.
-Existing explicit smart/group settings are respected and may delay group notices.
+The defaultJoinMode setting defaults to async: results never wait for siblings,
+but available notices share one message at the parent's next boundary or after
+a 200 ms idle hold. Explicit smart/group settings retain sibling waits; groups
+now use the full parent turn rather than a 100 ms spawn window. A lone spawn or
+a spawn outside a parent turn notifies individually.
 Change /agents -> Settings -> Join mode to async for incremental processing.
 Flag-launched workflows retain their existing next-user-turn delivery and headless
 lifecycle limitations. Nested children remain owner-scoped, not root broadcasts.
 
-A notice does not consume a result. The 200ms hold rechecks consumption and
-execution identity. Group snapshots cannot be rewritten by a resumed execution;
-group ownership cancels any earlier individual hold. These checks apply before
+A notice does not consume a result. Sending rechecks consumption and execution
+identity. Accepting a resume cancels any pending notice for the previous run.
+Group snapshots cannot be rewritten by a resumed execution; group ownership
+cancels any earlier individual hold. These checks apply before
 handoff to Pi, not to messages already queued there. A later retrieval can leave
 a stale queued notice and an unnecessary continuation; exactly-once delivery and
 crash recovery are not promised.
@@ -88,7 +93,8 @@ upstream completion-age cleanup policy.
 ## Imported fixes retained
 
 - #311 (8d56733): foreground/nested inline result IDs and tests.
-- #316 (75e0db9): dispose widget, group and debounce timers on shutdown.
+- #316 (75e0db9, now upstream 83be963): dispose widget, groups and pending notices
+  on shutdown. Turn-boundary batching replaces the old debounce timer.
 - #348 (1ecd1e5): unread retention. Its Pi 0.87-specific clone implementation is
   superseded by upstream's Pi 1.1 session-entry clone; the history, branch and
   exact-prompt regression scenarios remain covered.

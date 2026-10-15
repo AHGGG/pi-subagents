@@ -32,7 +32,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-> **Breaking for the personal fork:** `0.20.0-ahggg.1` requires Pi 1.1.0 or newer. Host runtime peers remain `"*"` for Pi's loader contract; the supported minimum is documented and covered by the pinned CI baseline.
+> **Personal fork:** `0.22.0-ahggg.1` requires Pi 1.1.0 or newer. Host runtime peers remain `"*"` for Pi's loader contract; the supported minimum is documented and covered by the pinned CI baseline.
+
+### Changed
+- **Sync the personal fork through upstream `ca93a52`.** Adopt boundary-batched completion delivery, package-provided agents/workflows, usage events, RPC steering and resumed-run turn budgets. Preserve provider-scoped model selection, saved-result recovery, lifecycle/worktree safety, async default, explicit smart/group sibling waits and suppression of superseded notices. See [merge decisions](docs/UPSTREAM_SYNC.md).
+
+### Added
+- **`subagents:rpc:steer` lets a cross-extension caller message an agent it spawned** ([#292](https://github.com/tintinweb/pi-subagents/pull/292) — thanks [@efpiva](https://github.com/efpiva)). The bus-side half of `steer_subagent`: id only, the same ownership guard as `stop`, `Agent is not running` once the agent has settled, and it emits `subagents:steered` like the tool does. Outside the `ping` handshake like `consume`.
+- **Per-message `subagents:usage` event for every agent, and `subagents:disposed` at shutdown** (closes [#376](https://github.com/tintinweb/pi-subagents/issues/376), [#377](https://github.com/tintinweb/pi-subagents/pull/377) — thanks [@erikdarlingdata](https://github.com/erikdarlingdata)). Another extension could not keep a live, accurate ledger of subagent spend: the lifecycle events report top-level agents only, once, at the end, and the ancestor records fold a nested child's spend into every parent. `subagents:usage` now fires once per assistant message for every agent, nested and workflow children included, carrying `type`, `model`, the effective `thinking` level (plus `requestedThinking` when the agent did not get what it asked for), `depth`, `parentAgentId`, `workflowId` and that one message's spend as a pi `Usage`. It is not gated by `reportUsage`. `subagents:disposed` fires at the end of `session_shutdown`, after every agent is stopped, as the point after which a final synchronous flush is complete. See [Events](README.md#events).
+
+### Fixed
+- **Steering from the conversation viewer or the fleet list now emits `subagents:steered`.** Only the `steer_subagent` tool and an `@handle` steer did before, so an extension watching the event missed every steer typed into a viewer. The event now fires from `AgentManager.steer`, which every path except the steer tools goes through.
+- **Resumed agents are bounded by `max_turns` again, and their turn counter moves** (fixes [#368](https://github.com/tintinweb/pi-subagents/issues/368) — thanks [@mratsim](https://github.com/mratsim)). The steer → grace → abort machine ran only over a spawn's first prompt, so a resume — from the `Agent` tool, an `@handle`, a nested agent or a workflow — had no turn limit at all and its widget row stayed at `↻1`. A resumed run now gets a fresh budget counted from the resume prompt, resolved as for a spawn, and can end `steered` or `aborted` like the first run.
+
+## [0.22.0] - 2026-10-13
+
+> **⚠️ Possibly breaking — background completion delivery changed ([#388](https://github.com/tintinweb/pi-subagents/pull/388)):**
+> - **`smart`, the default join mode, no longer combines a turn's background agents into one notification.** Each result reaches the parent at its next boundary, so a parent waiting idle on several agents can take one turn per finish. Set the join mode to `group` for one notification per turn's batch.
+> - **A completion pending when you press Esc now starts a turn once the interrupted turn stops.**
+> - **`group` no longer groups a lone spawn, or spawns from different parent turns.**
+
+### Added
+- **A pi package can ship subagents and workflow scripts** ([#109](https://github.com/tintinweb/pi-subagents/issues/109), [#262](https://github.com/tintinweb/pi-subagents/pull/262) — thanks [@iamfj](https://github.com/iamfj), [@RicardoMonteiroSimoes](https://github.com/RicardoMonteiroSimoes) and [@Brambovich](https://github.com/Brambovich)). Distributing an agent used to mean telling users to copy `.md` files into `.pi/agents/`. A package now declares them instead, and `pi install` is the whole setup:
+  ```json
+  { "pi": { "subagents": { "agents": ["./agents"], "workflows": ["./workflows"] } } }
+  ```
+  The top-level `pi-subagents` key works too, so one manifest serves both this extension and [`nicobailon/pi-subagents`](https://github.com/nicobailon/pi-subagents). Only packages pi has actually installed are read — never `node_modules` — and a package configured by an untrusted project stays invisible. Package agents rank **below every agent you wrote**, so one can offer a `reviewer` but never take the name from yours, and `/agents` shows them read-only with *Eject* and *Disable*. On by default, since installing a package already lets pi run its `extensions/`; `packageAgents` and `packageWorkflows` (`true`, `false`, or an allowlist) narrow it. Full guide: [`docs/packages.md`](https://github.com/tintinweb/pi-subagents/blob/master/docs/packages.md).
+
+### Changed
+- **Background completions that finish together reach the parent as one message, and none waits for its siblings, as in Claude Code** ([#388](https://github.com/tintinweb/pi-subagents/pull/388)). A busy parent gets everything that finished during its tool batch in one message before its next model call; an idle parent gets a turn about 200 ms after a completion, with anything else that finished in that window. The default `smart` join mode no longer holds a finished agent for up to 30 s until its siblings finish (`async` now means the same as `smart`). `group` batches by parent turn instead of a 100 ms spawn window, so worktree agents group reliably. A completion pending when you press Esc is no longer dropped: it is delivered once the interrupted turn stops, starting a turn, as Claude Code does. `get_subagent_result` now suppresses a notification any time before it is sent, not only within 200 ms.
+
+### Fixed
+- **`session_shutdown` now disposes the widget and group-join manager** (fixes [#256](https://github.com/tintinweb/pi-subagents/issues/256), [#316](https://github.com/tintinweb/pi-subagents/pull/316) — thanks [@joshua-zyy](https://github.com/joshua-zyy)). The handler released the fleet, scheduler and manager but left the `AgentWidget` render interval and the `GroupJoinManager` group timeouts running. Because `session_shutdown` also fires on reload and session replacement, where the Node process survives, those timers outlived the activation and fired into the next session's UI and group state, accumulating across reloads. `session_before_switch` still keeps both, since a vetoed switch continues the session.
+
+## [0.21.0] - 2026-10-12
+
+> **⚠️ Possibly breaking — four fixes below change what an existing setup does:**
+> - **An agent file with `isolation: worktree` now fails to start outside a git repo** on mention and RPC spawns, where it used to run in the main checkout.
+> - **An agent file's `isolated:` and `isolation:` now override the RPC caller.** A caller's `isolated: false` or `isolation: "worktree"` no longer wins over the file.
+> - **Every subagent with `extensions: true` starts its own `mcp.json` servers.** To keep the old behavior, add `exclude_extensions: builtin:mcp` to the agent, put `-builtin:mcp` in pi's `extensions` setting, or start pi with `--no-mcp`.
+> - **Subagents in an untrusted project no longer load its `.pi` extensions or settings.**
 
 ### Added
 - **Fullscreen conversation observer** ([#357](https://github.com/tintinweb/pi-subagents/pull/357) — thanks [@sadiksaifi](https://github.com/sadiksaifi)). In pi's fullscreen mode, the default, an agent opened from FleetView, `/agents` or the workflow inspector now fills the terminal with mouse-wheel scrolling, a draggable scrollbar that follows pi's `fullscreenScrollbar` setting, clickable footer controls, and a `Ctrl+End` jump-to-latest marker that counts new messages. Regular mode keeps the floating viewer.

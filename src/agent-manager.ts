@@ -31,6 +31,12 @@ import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorkt
 
 export type OnAgentComplete = (record: AgentRecord) => void;
 export type OnAgentStart = (record: AgentRecord) => void;
+/**
+ * Fired by `steer()` once a message is delivered or queued. Every steer path
+ * goes through it except the steer tools (`steer_subagent` in index.ts, and its
+ * nested twin in nested-tools.ts), which await the session directly.
+ */
+export type OnAgentSteered = (record: AgentRecord, message: string) => void;
 export type OnAgentCompact = (record: AgentRecord, info: CompactionInfo) => void;
 /**
  * Fired once per assistant `message_end`, for EVERY agent this manager owns —
@@ -312,6 +318,14 @@ interface ResumeOptions {
    * record — the historical behavior.
    */
   isBackground?: boolean;
+  /**
+   * Explicit turn limit for the resumed run: this, else the limit the agent
+   * was spawned with, else its type's own `max_turns`, else the default —
+   * counted afresh from the resume prompt (#368).
+   */
+  maxTurns?: number;
+  /** Called at the end of each resumed turn with the count since the resume. */
+  onTurnEnd?: (turnCount: number) => void;
   /** Called on tool start/end with activity info (for streaming progress to UI). */
   onToolActivity?: (activity: ToolActivity) => void;
   /** Called once per assistant message_end with that message's usage delta. */
@@ -400,6 +414,7 @@ export class AgentManager {
   private onStart?: OnAgentStart;
   private onCompact?: OnAgentCompact;
   private onUsage?: OnAgentUsage;
+  private onSteered?: OnAgentSteered;
   private maxConcurrent: number;
   private maxConcurrentForeground = DEFAULT_MAX_CONCURRENT_FOREGROUND;
   /** Base repos worktrees were created from — so dispose() can prune them all,
@@ -451,11 +466,13 @@ export class AgentManager {
     onStart?: OnAgentStart,
     onCompact?: OnAgentCompact,
     onUsage?: OnAgentUsage,
+    onSteered?: OnAgentSteered,
   ) {
     this.onComplete = onComplete;
     this.onStart = onStart;
     this.onCompact = onCompact;
     this.onUsage = onUsage;
+    this.onSteered = onSteered;
     this.maxConcurrent = maxConcurrent;
     // Cleanup consumed completed agents after 10 minutes
     this.cleanupInterval = setInterval(() => this.cleanup(), 60_000);
@@ -1209,6 +1226,9 @@ export class AgentManager {
     catch (err) { console.warn("[pi-subagents] Resume callback failed for " + id, err); }
 
     record.promise = resumeAgent(session, prompt, {
+      type: record.type,
+      maxTurns: options.maxTurns ?? record.invocation?.maxTurns,
+      onTurnEnd: options.onTurnEnd,
       onToolActivity: activity => {
         if (activity.type === "end") record.toolUses++;
         options.onToolActivity?.(activity);
@@ -1224,14 +1244,18 @@ export class AgentManager {
         options.onCompaction?.(info);
       },
       signal: controller.signal,
-    }).then(({ text, failure }) => {
-      if (record.status !== "stopped") record.status = failure ? "error" : "completed";
-      if (record.status !== "stopped" && failure) record.error = failure;
+    }).then(({ text, failure, aborted, steered }) => {
+      if (record.status !== "stopped") {
+        record.status = aborted ? "aborted" : failure ? "error" : steered ? "steered" : "completed";
+        if (!aborted && failure) record.error = failure;
+      }
       record.result = text;
       return text;
     }).catch(err => {
-      if (record.status !== "stopped") record.status = "error";
-      record.error = err instanceof Error ? err.message : String(err);
+      if (record.status !== "stopped") {
+        record.status = "error";
+        record.error = err instanceof Error ? err.message : String(err);
+      }
       return "";
     }).finally(() => {
       this.detachParentAbort(record);
@@ -1251,7 +1275,10 @@ export class AgentManager {
    * current tool execution and appears as a user message. If the session isn't
    * ready yet, the message is queued on `pendingSteers` and flushed when the
    * session is created. Returns false if the agent can't accept steering
-   * (unknown id, or no longer running/queued).
+   * (unknown id, or no longer running/queued). Fires `onSteered` on either
+   * accepted path, so the UI viewers, an `@handle` and the RPC all report
+   * the steer the same way without each emitting by hand. The steer tools
+   * bypass this method because they await delivery.
    */
   steer(id: string, message: string): boolean {
     const record = this.agents.get(id);
@@ -1263,6 +1290,7 @@ export class AgentManager {
       if (!record.pendingSteers) record.pendingSteers = [];
       record.pendingSteers.push(message);
     }
+    this.onSteered?.(record, message);
     return true;
   }
 
