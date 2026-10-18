@@ -38,6 +38,7 @@ export type FleetUICtx = {
   onTerminalInput(handler: (data: string) => { consume?: boolean; data?: string } | undefined): () => void;
   getEditorText(): string;
   notify(message: string, type?: "info" | "warning" | "error"): void;
+  confirm(title: string, message: string): Promise<boolean>;
   custom<T>(
     factory: (tui: any, theme: Theme, keybindings: any, done: (result: T) => void) => { render(width: number): string[]; invalidate(): void; dispose?(): void },
     options?: { overlay?: boolean; overlayOptions?: unknown; onHandle?: (handle: unknown) => void },
@@ -244,16 +245,16 @@ export class FleetList {
 
   /**
    * Agents shown in the list, ordered earliest-launched first so the ones you
-   * started sooner sit at the top. Every row is openable (has a session), so Enter
-   * never dead-ends. Included: running/queued, plus the agent currently being
+   * started sooner sit at the top. Queued agents without a session offer Stop.
+   * Included: running/queued, plus the agent currently being
    * viewed, plus recently-finished ones (they linger briefly before dropping out).
-   * Pending agents with no session yet are hidden until they start.
+   * Other agents with no session yet are hidden until they start.
    * (`listAgents()` is newest-first, so we re-sort.)
    */
   private agentRecords(): AgentRecord[] {
     const now = Date.now();
     return this.manager.listAgents()
-      .filter(a => isTopLevelAgent(a) && a.session && (
+      .filter(a => isTopLevelAgent(a) && (a.session || a.status === "queued") && (
         a.status === "running" || a.status === "queued"
         || a.id === this.viewingAgentId
         || (a.completedAt != null && now - a.completedAt < FINISHED_LINGER_MS)
@@ -321,7 +322,7 @@ export class FleetList {
     // While an overlay is open, let it own all input. Checked before the focus
     // test below, which would otherwise read the dialog holding the keyboard as
     // "the user left the list" and reset the selection out from under it.
-    if (this.viewerClose || this.viewingWorkflowId) return undefined;
+    if (this.viewingAgentId || this.viewingWorkflowId) return undefined;
     // Input listeners fire BEFORE the focused component, and dialogs
     // (ctx.ui.select/confirm/input, pi's own menus) swap the prompt editor out
     // while getEditorText() still reads the detached — empty — editor. So when
@@ -410,6 +411,25 @@ export class FleetList {
     const record = entry.record;
     if (!this.ui) return;
     if (!record.session) {
+      if (record.status === "queued") {
+        const runId = record.runId;
+        this.viewingAgentId = record.id;
+        void this.ui.confirm("Stop queued agent", `Stop "${record.description}"?`).then(confirmed => {
+          if (!confirmed || !this.ui) return;
+          if (record.runId !== runId) {
+            this.ui.notify(`Agent "${record.description}" has started a newer run; open it again to stop it.`, "info");
+            return;
+          }
+          // Resolve by the captured id: the queue can drain while the dialog is up.
+          if (this.manager.abort(record.id)) {
+            const action = this.manager.isRunPending(record) ? "Stop requested for" : "Stopped";
+            this.ui.notify(`${action} "${record.description}".`, "info");
+          } else {
+            this.ui.notify(`Agent "${record.description}" is no longer queued or running.`, "info");
+          }
+        }).then(() => this.clearViewer(), () => this.clearViewer());
+        return;
+      }
       this.ui.notify(`Agent is ${record.status} — no session available.`, "info");
       return;
     }
@@ -552,7 +572,7 @@ export class FleetList {
     const tokens = getLifetimeTotal(record.lifetimeUsage);
     const elapsedMs = (record.completedAt ?? Date.now()) - record.startedAt; // freezes once finished
     const cost = this.showCost() ? formatCost(getLifetimeCost(record.lifetimeUsage)) : "";
-    const stats = `${formatFleetElapsed(elapsedMs)} · ${formatFleetTokens(tokens)}${cost ? ` · ${cost}` : ""}`;
+    const stats = `${record.status === "queued" ? "queued · " : ""}${formatFleetElapsed(elapsedMs)} · ${formatFleetTokens(tokens)}${cost ? ` · ${cost}` : ""}`;
     const right = selected ? theme.fg("text", stats) : theme.fg("dim", stats);
     return rightAlign(left, right, width);
   }

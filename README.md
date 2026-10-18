@@ -194,7 +194,7 @@ While subagents are running, a Claude Code-style navigable list renders **below*
                                                                                    ↓ 3 more
 ```
 
-Running [workflows](#subagentworkflow) appear as a single `workflow` row above the agents, carrying their agent counts in place of a description. `Enter` on one opens the same two-pane inspector `/agents → Workflows` does, rather than a conversation overlay. A run's own agents are *not* listed separately — they belong to the run, which reports for them, so they are filtered out of the fleet list, the above-editor widget, the `/agents` menus and `@handle` resolution exactly as nested children are. They are also outside the `maxConcurrent` pool: the run has its own concurrency cap, and routing a fan-out through the session pool as well would let one workflow starve everything else. The agents are ordered earliest-launched first, and only agents you can actually open are shown (pending/queued agents with no session yet appear once they start). At an **empty prompt**, press `↓` (or `←`) to move focus from the prompt into the list — the selected row is marked `●`, the rest `○`. The selected row renders in the theme's primary text color rather than the muted/dim treatment of the others; an agent with a configured `color` shows its badge there too, bolded. `↑`/`↓` move the selection, `Enter` opens the selected agent's live conversation overlay (it auto-updates as the agent works), and `Esc` (or `↑` above `main`) returns to the prompt. Selecting `main` returns to the normal view. Inside the overlay, press `Enter` to steer the running agent — type a message and `Enter` to send it (`Esc` or an empty submit returns), and it redirects the agent the same way the `steer_subagent` tool does. On a running foreground `Agent` call, press `b` to hand that run to the background; the hint only shows where the handoff is available. A viewer stays open when its agent finishes so you can read the final output, and finished agents linger in the list for a few seconds before dropping out. Typing anything at a non-empty prompt behaves normally — the list only captures arrow keys when the prompt is empty. Disable it entirely via `/agents → Settings → Fleet view`.
+Running [workflows](#subagentworkflow) appear as a single `workflow` row above the agents, carrying their agent counts in place of a description. `Enter` on one opens the same two-pane inspector `/agents → Workflows` does, rather than a conversation overlay. A run's own agents are *not* listed separately — they belong to the run, which reports for them, so they are filtered out of the fleet list, the above-editor widget, the `/agents` menus and `@handle` resolution exactly as nested children are. They are also outside the `maxConcurrent` pool: the run has its own concurrency cap, and routing a fan-out through the session pool as well would let one workflow starve everything else. The agents are ordered earliest-launched first. Queued agents are visible before their session exists; their rows say `queued` instead of showing running activity. Press `Enter` on a queued row to open a Stop confirmation. Cancelling that confirmation leaves the queue unchanged; confirming removes the queued run, or requests a stop if it started while the confirmation was open. At an **empty prompt**, press `↓` (or `←`) to move focus from the prompt into the list — the selected row is marked `●`, the rest `○`. The selected row renders in the theme's primary text color rather than the muted/dim treatment of the others; an agent with a configured `color` shows its badge there too, bolded. `↑`/`↓` move the selection, `Enter` opens the selected agent's live conversation overlay (it auto-updates as the agent works), and `Esc` (or `↑` above `main`) returns to the prompt. Selecting `main` returns to the normal view. Inside the overlay, press `Enter` to steer the running agent — type a message and `Enter` to send it (`Esc` or an empty submit returns), and it redirects the agent the same way the `steer_subagent` tool does. On a running foreground `Agent` call, press `b` to hand that run to the background; the hint only shows where the handoff is available. A viewer stays open when its agent finishes so you can read the final output, and finished agents linger in the list for a few seconds before dropping out. Typing anything at a non-empty prompt behaves normally — the list only captures arrow keys when the prompt is empty. Disable it entirely via `/agents → Settings → Fleet view`.
 
 ### Fullscreen conversation observer
 
@@ -585,6 +585,20 @@ Cancelling a `wait: true` call (for example, with `Esc`) stops only the wait. Th
 
 If the live record has been cleaned up, the fork can recover its saved final result by exact ID from the current parent-session branch. This reads recorded text without rerunning the child. A newer unfinished execution prevents an older answer from being returned as current; see [result recovery and limits](docs/HARDENING.md#result-retrieval).
 
+### `list_subagents`
+
+List the current session's top-level agents and the two pools' current capacity. Takes no parameters. Returns agent IDs, handles, states and one-based queue positions within each pool, plus retained settled records. It does not consume results or reserve slots. Nested and workflow-owned children remain under their owner's controls.
+
+### `stop_subagent`
+
+Cancel a queued or running top-level agent owned by the current session.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `agent_id` | string | yes | Exact live agent ID or handle from `Agent` or `list_subagents` |
+
+A queued run is removed immediately without starting. A running run receives a stop request and retains its slot until finalization; the response distinguishes these outcomes and includes current capacity. Repeated stops report the current state. Historical IDs without a live record cannot be stopped. Use `get_subagent_result({ agent_id, wait: true })` to wait for finalized partial output.
+
 ### `steer_subagent`
 
 Send a steering message to a running agent. The message interrupts after the current tool execution.
@@ -684,11 +698,24 @@ There are two independent pools.
 
 The two are deliberately **not** one limit. A foreground agent blocks the parent anyway — the parent could have done that work itself without paying a slot — so charging it to the background pool would let a saturated pool starve the main session.
 
-The foreground pool does not cover `resume`: a foreground resume reopens an existing session and never reaches the spawn path, so several blocking resumes in one message can still run at once. A *background* resume does take a background slot and queues behind them like any other background agent.
+Resumes use the same pools as spawns: a blocking foreground resume takes a foreground slot when that pool is bounded, and a background resume takes a background slot. Either queues when its own pool is full. Detached non-background spawns (for example, RPC without `isBackground: true`) take neither slot.
 
 Nested children and a [workflow](#subagentworkflow)'s agents are outside the pool entirely. A nested child would deadlock behind a parent waiting on it; a workflow already bounds its own fan-out at `max(1, min(16, cpus - 2))`, and counting its agents twice would let one run fill the session's pool and starve everything else.
 
 Sending a foreground agent to the background moves its slot: it gives up the foreground slot (so a queued blocking `Agent` call can start) and takes a background one. If the background pool is already full it runs above capacity rather than being suspended, and queued background work waits until the count drops back under the limit.
+
+### Runtime visibility
+
+The main model receives an append-only runtime-status message before its first applicable turn, with the effective limits and delegation defaults. It is hidden from the normal chat UI and does not trigger an extra model turn. A new runtime, or compaction that removes the prior notice, gets a fresh notice; ordinary turns do not repeat it just because counts changed.
+
+- `Agent` dispatch results include current background/foreground counts and, when queued, the agent's one-based position in its own pool. Queued work starts automatically; do not resubmit it.
+- Completion notifications include a current capacity snapshot after completion has released slots and the queue has drained. Another queued run may already occupy a released slot.
+- `list_subagents` provides an on-demand snapshot; `stop_subagent` cancels unwanted queued or running work. Their tool definitions stay static while the counts change.
+- Changes to effective runtime limits/defaults through `/agents → Settings` append a status update without starting a turn. Hand-edited `subagents.json` values require reload/restart before they become effective; editing a file is not a live settings change.
+
+Each pool reports `limit`, `occupied`, `active`, `available` and `queued`. Occupied counts actual scheduler charges, including startup, stopping and required finalization; a stopped status does not mean its slot is free. Active counts started, unsettled runs. Unlimited foreground runs are active without taking a scheduler slot, so active can exceed occupied; runs keep their original charges when limits change. Unlimited limit/availability is represented as `null` in the manager snapshot and `unlimited` in text. Availability is clamped to zero when bypasses or handoffs put a pool above its limit.
+
+These are point-in-time observations, not reservations or guarantees about a later dispatch. Nested and workflow-owned children are excluded. Runtime counts are appended to messages/results rather than rewritten into the system prompt or tool descriptions; this avoids count-driven prefix changes but makes no provider prompt-cache guarantee.
 
 ## Join Strategies
 
@@ -1088,7 +1115,8 @@ src/
 
   # Execution
   agent-runner.ts     # Session creation, execution, graceful max_turns, steer/resume
-  agent-manager.ts    # Agent lifecycle, concurrency queue, completion notifications
+  agent-manager.ts    # Agent lifecycle, independent pool/queue snapshots, completion notifications
+  runtime-status.ts   # Append-only runtime configuration notices and capacity formatting
   nested-tools.ts     # Delegation tools handed to subagents (nested spawn/collect/steer)
   child-context.ts    # AsyncLocalStorage flag marking work done for a child session
   abortable.ts        # Race a wait against Esc without cancelling the background child

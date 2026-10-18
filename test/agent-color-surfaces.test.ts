@@ -198,6 +198,7 @@ describe("custom agent color runtime surfaces", () => {
       onTerminalInput: vi.fn(() => vi.fn()),
       getEditorText: vi.fn(() => ""),
       notify: vi.fn(),
+      confirm: vi.fn(async () => false),
       custom: (() => new Promise<undefined>(() => {})) as FleetUICtx["custom"],
     });
 

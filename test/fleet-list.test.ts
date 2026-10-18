@@ -47,7 +47,7 @@ function plain(row: string): string {
   return row.replace(/\u001b\[[0-9;]*m/g, "").replace(/<\/?[a-zA-Z]+>|\*/g, "");
 }
 
-/** A no-op session so a record is "openable" by default (the list hides session-less agents). */
+/** A no-op session so a record opens a conversation by default. */
 const FAKE_SESSION = { subscribe: () => () => {}, messages: [] };
 
 function makeRecord(over: Partial<AgentRecord> = {}): AgentRecord {
@@ -69,7 +69,15 @@ function makeRecord(over: Partial<AgentRecord> = {}): AgentRecord {
 function fakeManager(agents: AgentRecord[]): AgentManager {
   return {
     listAgents: () => agents,
-    abort: () => true,
+    abort: vi.fn((id: string) => {
+      const record = agents.find(agent => agent.id === id);
+      if (!record || (record.status !== "queued" && record.status !== "running")) return false;
+      record.runSettled = record.status === "queued";
+      record.status = "stopped";
+      record.completedAt = Date.now();
+      return true;
+    }),
+    isRunPending: (record: AgentRecord) => record.runSettled === false,
     steer: vi.fn(() => true),
   } as unknown as AgentManager;
 }
@@ -101,6 +109,7 @@ interface Harness {
   overlayClosed: () => boolean;
   /** Simulate the viewer closing itself (Esc → done); flushes the close microtask. */
   closeOverlay: () => Promise<void>;
+  answerConfirmation: (confirmed: boolean) => Promise<void>;
   /** The fake `tui` handed to the widget factory; tests set `focusedComponent` on it. */
   widgetTui: { requestRender(): void; focusedComponent?: unknown };
 }
@@ -136,6 +145,7 @@ function harness(
   let overlayDone: ((r: undefined) => void) | undefined;
   let overlayComponent: { handleInput(data: string): void } | undefined;
   let overlayOptions: OverlayOptions | undefined;
+  let confirmDone: ((confirmed: boolean) => void) | undefined;
   const fakeTui = { mode: opts.tuiMode ?? "regular", handleMouse: () => undefined, requestRender: () => {}, terminal: { columns: 120, rows: 40 } };
 
   const ui: FleetUICtx = {
@@ -143,6 +153,7 @@ function harness(
     onTerminalInput: (h) => { inputHandler = h; return () => { inputHandler = undefined; }; },
     getEditorText: () => editorText,
     notify: (message, level) => { notices.push(`${level}: ${message}`); },
+    confirm: vi.fn(() => new Promise<boolean>(resolve => { confirmDone = resolve; })),
     custom: ((factory: any, options?: { overlayOptions?: OverlayOptions | (() => OverlayOptions) }) => {
       opened = true;
       return new Promise<undefined>((resolve) => {
@@ -186,6 +197,7 @@ function harness(
     overlayOpened: () => opened,
     overlayClosed: () => closed,
     closeOverlay: async () => { overlayDone?.(undefined); await Promise.resolve(); },
+    answerConfirmation: async confirmed => { confirmDone?.(confirmed); await Promise.resolve(); await Promise.resolve(); },
     widgetTui: fakeTui,
   };
 }
@@ -358,7 +370,7 @@ describe("FleetList navigation", () => {
       const fleet = new FleetList(manager, new Map());
       fleet.setUICtx({
         setWidget: () => {}, onTerminalInput: () => () => {}, getEditorText: () => "",
-        notify: () => {}, custom: (() => new Promise<undefined>(() => {})) as FleetUICtx["custom"],
+        notify: () => {}, confirm: async () => false, custom: (() => new Promise<undefined>(() => {})) as FleetUICtx["custom"],
       });
       fleet.update();          // shows list, arms the timer
       fleet.setEnabled(false); // hides, clears the timer
@@ -468,14 +480,16 @@ describe("FleetList rendering", () => {
     expect(oldIdx).toBeLessThan(newIdx); // earliest sits above the later one
   });
 
-  it("hides agents that have no session yet (pending)", () => {
+  it("shows queued agents without sessions, but hides other session-less records", () => {
     const agents = [
       makeRecord({ id: "live", description: "running one" }),
       makeRecord({ id: "pending", description: "queued one", status: "queued", session: undefined }),
+      makeRecord({ id: "starting", description: "starting one", session: undefined }),
     ];
     const lines = harness(agents).render();
     expect(lines.some(l => l.includes("running one"))).toBe(true);
-    expect(lines.some(l => l.includes("queued one"))).toBe(false);
+    expect(lines.find(l => l.includes("queued one"))).toContain("queued ·");
+    expect(lines.some(l => l.includes("starting one"))).toBe(false);
   });
 
   it("collapses overflow into a '↓ N more' indicator", () => {
@@ -523,6 +537,98 @@ describe("FleetList rendering", () => {
 });
 
 describe("FleetList overlay lifecycle", () => {
+  it("offers Stop for a fresh queued agent without opening a conversation", async () => {
+    const record = makeRecord({ id: "queued", description: "waiting", status: "queued", session: undefined });
+    const h = harness([record]);
+    try {
+      h.press(DOWN);
+      h.press(DOWN);
+      h.press(ENTER);
+      expect(h.ui.confirm).toHaveBeenCalledWith("Stop queued agent", 'Stop "waiting"?');
+      expect(h.overlayOpened()).toBe(false);
+      expect(h.manager.abort).not.toHaveBeenCalled();
+      // A fresh dialog may not have established focusedComponent yet.
+      expect(h.press(DOWN)).toBeUndefined();
+      expect(h.press(ENTER)).toBeUndefined();
+      expect(h.ui.confirm).toHaveBeenCalledTimes(1);
+      await h.answerConfirmation(true);
+      expect(h.manager.abort).toHaveBeenCalledExactlyOnceWith("queued");
+      expect(record.status).toBe("stopped");
+      expect(h.notices()).toEqual(['info: Stopped "waiting".']);
+    } finally {
+      h.fleet.dispose();
+    }
+  });
+
+  it("leaves a queued agent alone when Stop is cancelled and restores navigation", async () => {
+    const h = harness([makeRecord({ status: "queued", session: undefined })]);
+    try {
+      h.press(DOWN);
+      h.press(DOWN);
+      h.press(ENTER);
+      await h.answerConfirmation(false);
+      expect(h.manager.abort).not.toHaveBeenCalled();
+      expect(h.notices()).toEqual([]);
+      expect(h.press(UP)).toEqual({ consume: true });
+      expect(h.render().find(line => line.includes("main"))).toContain("●");
+    } finally {
+      h.fleet.dispose();
+    }
+  });
+
+  it("stops the same id when it starts while confirmation is open, without claiming settlement", async () => {
+    const record = makeRecord({ id: "queued", description: "waiting", status: "queued", session: undefined });
+    const agents = [record];
+    const h = harness(agents);
+    try {
+      h.press(DOWN);
+      h.press(DOWN);
+      h.press(ENTER);
+      record.status = "running";
+      record.session = FAKE_SESSION as unknown as AgentRecord["session"];
+      agents.unshift(makeRecord({ id: "other", startedAt: record.startedAt - 1 }));
+      await h.answerConfirmation(true);
+      expect(h.manager.abort).toHaveBeenCalledExactlyOnceWith("queued");
+      expect(agents[0].status).toBe("running");
+      expect(h.notices()).toEqual(['info: Stop requested for "waiting".']);
+      expect(h.render().find(line => line.includes("waiting"))).toContain("●");
+    } finally {
+      h.fleet.dispose();
+    }
+  });
+
+  it("reports when a queued agent settles before confirmation", async () => {
+    const record = makeRecord({ description: "waiting", status: "queued", session: undefined });
+    const h = harness([record]);
+    try {
+      h.press(DOWN);
+      h.press(DOWN);
+      h.press(ENTER);
+      record.status = "completed";
+      await h.answerConfirmation(true);
+      expect(h.notices()).toEqual(['info: Agent "waiting" is no longer queued or running.']);
+    } finally {
+      h.fleet.dispose();
+    }
+  });
+
+  it("does not stop a newer run resumed while confirmation is open", async () => {
+    const record = makeRecord({ description: "waiting", status: "queued", session: undefined, runId: 1 });
+    const h = harness([record]);
+    try {
+      h.press(DOWN);
+      h.press(DOWN);
+      h.press(ENTER);
+      record.status = "running";
+      record.runId = 2;
+      await h.answerConfirmation(true);
+      expect(h.manager.abort).not.toHaveBeenCalled();
+      expect(h.notices()).toEqual(['info: Agent "waiting" has started a newer run; open it again to stop it.']);
+    } finally {
+      h.fleet.dispose();
+    }
+  });
+
   it.each<{ mode: TuiMode; expected: OverlayOptions }>([
     { mode: "regular", expected: { anchor: "center", width: "90%", maxHeight: "70%" } },
     { mode: "fullscreen", expected: { anchor: "top-left", width: "100%", maxHeight: "100%", margin: 0 } },

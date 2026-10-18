@@ -50,6 +50,37 @@ export type OnAgentCompact = (record: AgentRecord, info: CompactionInfo) => void
 export type OnAgentUsage = (record: AgentRecord, usage: LifetimeUsage) => void;
 export type CompactionInfo = { reason: "manual" | "threshold" | "overflow"; tokensBefore: number };
 
+export interface PoolCapacitySnapshot {
+  /** null means unlimited. */
+  limit: number | null;
+  /** Scheduler charges, retained through stopping and finalization. */
+  occupied: number;
+  /** Started, unsettled runs, including uncharged unlimited foreground runs. */
+  active: number;
+  /** null means unlimited; over-capacity pools report zero. */
+  available: number | null;
+  queued: number;
+}
+
+export interface AgentCapacitySnapshot {
+  id: string;
+  type: SubagentType;
+  description: string;
+  handle?: string;
+  status: AgentRecord["status"];
+  pool?: Pool;
+  /** One-based position within this agent's own pool. */
+  queuePosition?: number;
+  occupiesSlot: boolean;
+  pending: boolean;
+}
+
+export interface CapacitySnapshot {
+  background: PoolCapacitySnapshot;
+  foreground: PoolCapacitySnapshot;
+  agents: AgentCapacitySnapshot[];
+}
+
 /**
  * Default max concurrent background agents.
  *
@@ -501,6 +532,57 @@ export class AgentManager {
 
   getMaxConcurrentForeground(): number {
     return this.maxConcurrentForeground;
+  }
+
+  /** Session-owned agents only; owned children have their own concurrency controls. */
+  getCapacitySnapshot(): CapacitySnapshot {
+    const foregroundLimit = this.maxConcurrentForeground || null;
+    const snapshot: CapacitySnapshot = {
+      background: {
+        limit: this.maxConcurrent,
+        occupied: this.runningBackground,
+        active: 0,
+        available: Math.max(0, this.maxConcurrent - this.runningBackground),
+        queued: 0,
+      },
+      foreground: {
+        limit: foregroundLimit,
+        occupied: this.runningForeground,
+        active: 0,
+        available: foregroundLimit === null ? null : Math.max(0, foregroundLimit - this.runningForeground),
+        queued: 0,
+      },
+      agents: [],
+    };
+    const positions = new Map<string, { pool: Pool; position: number }>();
+    for (const entry of this.queue) {
+      const record = this.agents.get(entry.id);
+      if (!record || !isTopLevelAgent(record) || record.status !== "queued") continue;
+      positions.set(entry.id, { pool: entry.pool, position: ++snapshot[entry.pool].queued });
+    }
+    for (const record of this.listAgents()) {
+      if (!isTopLevelAgent(record)) continue;
+      const pending = this.isRunPending(record);
+      const queued = positions.get(record.id);
+      // Unlimited foreground runs deliberately take no scheduler charge. Keep
+      // their activity visible without pretending it reduces available slots.
+      const pool = queued?.pool ?? record.chargedPool ?? (pending
+        ? occupiesPoolSlot(record) ? "background" : occupiesForegroundSlot(record) ? "foreground" : undefined
+        : undefined);
+      if (pool && pending && record.status !== "queued") snapshot[pool].active++;
+      snapshot.agents.push({
+        id: record.id,
+        type: record.type,
+        description: record.description,
+        handle: record.handle,
+        status: record.status,
+        pool,
+        queuePosition: queued?.position,
+        occupiesSlot: record.chargedPool !== undefined,
+        pending,
+      });
+    }
+    return snapshot;
   }
 
   /**

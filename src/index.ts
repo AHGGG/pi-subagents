@@ -36,6 +36,7 @@ import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { getPackageAgentsGate, getPackageWorkflowsGate, invalidatePackageCache, packageNameForPath, seedProjectTrust, setPackageAgentsGate, setPackageWorkflowsGate, setProjectTrusted } from "./package-resources.js";
 import { findSavedResult, formatSavedResult, RESULT_ENTRY, RUN_START_ENTRY, snapshotRun } from "./result-history.js";
+import { formatCapacityStatus, RuntimeStatus, type RuntimeStatusSnapshot } from "./runtime-status.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
@@ -471,7 +472,10 @@ export default function (pi: ExtensionAPI) {
       if (shuttingDown) return;
       pi.sendMessage<NotificationDetails>({
         customType: "subagent-notification",
-        content: message.content,
+        // Completion bodies describe the finished run, but capacity describes
+        // NOW: settleRun drains its queue after recording the completion.
+        // Read once here, after the outbox has combined simultaneous finishes.
+        content: `${message.content}\n\n${fleetStatusText()}`,
         display: true,
         details: message.details,
       }, COMPLETION_DELIVERY_OPTIONS);
@@ -1564,6 +1568,7 @@ export default function (pi: ExtensionAPI) {
   // boundary where completions are delivered, as in Claude Code.
   pi.on("turn_end", (event) => {
     registerTurnGroup();
+    if (event.message.role === "assistant" && event.message.stopReason !== "aborted" && event.message.stopReason !== "error") flushRuntimeStatus();
     outbox.onTurnEnd(event.message.role === "assistant" ? event.message.stopReason : undefined);
   });
   pi.on("agent_end", () => outbox.onAgentEnd());
@@ -1636,6 +1641,59 @@ export default function (pi: ExtensionAPI) {
     },
     (event, payload) => pi.events.emit(event, payload),
   );
+
+  // This message is appended to the transcript, never patched into the
+  // system prompt or tool definitions. The persisted marker survives ordinary
+  // turns; a new runtime or a compacted-away marker gets one fresh snapshot.
+  const runtimeStatus = new RuntimeStatus();
+  let runtimeStatusDirty = false;
+  function runtimeToolsActive(): boolean {
+    const active = pi.getActiveTools?.();
+    const ownNames: readonly string[] = Object.values(SUBAGENT_TOOL_NAMES);
+    return active === undefined || active.some(name => ownNames.includes(name));
+  }
+  function runtimeSnapshot(): RuntimeStatusSnapshot {
+    return {
+      ...manager.getCapacitySnapshot(),
+      backgroundByDefault: getBackgroundByDefault(),
+      defaultJoinMode: getDefaultJoinMode(),
+      defaultMaxTurns: getDefaultMaxTurns(),
+      graceTurns: getGraceTurns(),
+      maxSubagentDepth: getMaxSubagentDepth(),
+    };
+  }
+  function fleetStatusText(snapshot = manager.getCapacitySnapshot()): string {
+    const rows = snapshot.agents.filter(agent => agent.pending).map(agent =>
+      `- ${agent.id}${agent.handle ? ` (@${agent.handle})` : ""}: ${agent.status}` +
+      `${agent.pool ? `; ${agent.pool}` : "; outside concurrency pools"}` +
+      `${agent.queuePosition === undefined ? "" : `; queue position ${agent.queuePosition}`}` +
+      `${agent.status !== "running" && agent.status !== "queued" ? "; finalizing" : ""}` +
+      `; ${JSON.stringify(agent.description)}`,
+    );
+    return `${formatCapacityStatus(snapshot)}\n${rows.length ? rows.join("\n") : "No pending top-level agents."}`;
+  }
+  function flushRuntimeStatus(): void {
+    if (!runtimeStatusDirty || shuttingDown || !currentCtx || !runtimeToolsActive()) return;
+    const message = runtimeStatus.prepareNotice(currentCtx.sessionManager.buildSessionProjection?.().messages, runtimeSnapshot());
+    runtimeStatusDirty = false;
+    if (message) {
+      // Explicit false: status alone never starts another model request.
+      pi.sendMessage(message, { triggerTurn: false });
+    }
+  }
+  pi.on("before_agent_start", (_event, ctx) => {
+    // Respect host tool selection: do not advertise tools a restricted main
+    // session cannot call. Child sessions are excluded at extension activation.
+    if (!runtimeToolsActive()) return;
+    const message = runtimeStatus.prepareNotice(ctx.sessionManager.buildSessionProjection?.().messages, runtimeSnapshot());
+    runtimeStatusDirty = false;
+    return message ? { message } : undefined;
+  });
+  pi.on("message_end", (event) => {
+    if (event.message.role === "custom" && event.message.customType === "subagents:runtime-status") {
+      runtimeStatus.observePersisted(event.message.details);
+    }
+  });
 
   // ---- Agent tool ----
 
@@ -2585,7 +2643,20 @@ Background completion notices reach your next model request after the current to
 
   // The mention path is handed THIS object, not the bare `agentTool` — see the
   // mention-clone header on why the clone must call the registered tool.
-  const registeredAgentTool = withUsageReporting(agentTool);
+  const registeredAgentTool = withUsageReporting({
+    ...agentTool,
+    execute: async (...args: Parameters<typeof agentTool.execute>) => {
+      const result = await agentTool.execute(...args);
+      const snapshot = manager.getCapacitySnapshot();
+      const own = snapshot.agents.find(agent => agent.id === result.details?.agentId);
+      const currentStatus = own ? `\nCurrent agent status: ${own.status}${own.pending && own.status !== "queued" && own.status !== "running" ? " (finalizing)" : ""}.` : "";
+      const position = own?.queuePosition === undefined ? "" : `\nQueue position: ${own.queuePosition} in ${own.pool} pool.`;
+      return {
+        ...result,
+        content: [...result.content, { type: "text" as const, text: formatCapacityStatus(snapshot) + currentStatus + position }],
+      };
+    },
+  });
   pi.registerTool(registeredAgentTool);
 
   // ---- Workflow tool ----
@@ -3012,6 +3083,42 @@ Background completion notices reach your next model request after the current to
     });
   }
 
+  // ---- Fleet controls (top-level only; never inherited by child sessions) ----
+
+  registerToolReportingUsage(defineTool({
+    name: SUBAGENT_TOOL_NAMES.LIST,
+    label: "List Agents",
+    description: "List this session's top-level subagents and current background/foreground capacity. Counts are snapshots, not reserved slots. Nested and workflow-owned children are controlled by their owner.",
+    parameters: Type.Object({}),
+    execute: async () => {
+      const snapshot = manager.getCapacitySnapshot();
+      const settled = snapshot.agents.filter(agent => !agent.pending);
+      const rows = settled.map(agent => `- ${agent.id}${agent.handle ? ` (@${agent.handle})` : ""}: ${agent.status}; ${JSON.stringify(agent.description)}`);
+      return textResult(fleetStatusText(snapshot) + (rows.length ? `\nSettled agents:\n${rows.join("\n")}` : ""));
+    },
+  }));
+
+  registerToolReportingUsage(defineTool({
+    name: SUBAGENT_TOOL_NAMES.STOP,
+    label: "Stop Agent",
+    description: "Cancel a queued or running top-level subagent owned by this session. A queued agent is removed immediately; a running agent is asked to stop and holds its slot until finalization. Use get_subagent_result with wait: true to await its finalized result.",
+    parameters: Type.Object({
+      agent_id: Type.String({ description: "The exact agent ID or handle returned by Agent or list_subagents." }),
+    }),
+    execute: async (_toolCallId, params) => {
+      const record = resolveAgentRef(params.agent_id);
+      if (!record || !isTopLevelAgent(record)) return textResult(`Agent not found or not accessible: ${JSON.stringify(params.agent_id)}. Stop requires a live record owned by this session.`);
+      const accepted = manager.abort(record.id);
+      const pending = manager.isRunPending(record);
+      const outcome = accepted
+        ? pending ? "Stop requested; finalization is still pending." : "Stopped; removed from the queue without starting."
+        : pending ? "Already stopping or finalizing; any occupied slot remains held until finalization." : `Already finished (status: ${record.status}).`;
+      widget.update();
+      fleet.update();
+      return textResult(`Agent: ${record.id}\n${outcome}\n\n${fleetStatusText()}`);
+    },
+  }));
+
   // ---- get_subagent_result tool ----
 
   registerToolReportingUsage(defineTool({
@@ -3346,7 +3453,23 @@ Background completion notices reach your next model request after the current to
 
   async function viewAgentConversation(ctx: ExtensionCommandContext, record: AgentRecord) {
     if (!record.session) {
-      ctx.ui.notify(`Agent is ${record.status === "queued" ? "queued" : "expired"} — no session available.`, "info");
+      if (record.status === "queued") {
+        const runId = record.runId;
+        if (await ctx.ui.confirm("Stop queued agent", `Stop "${record.description}"?`)) {
+          if (record.runId !== runId) {
+            ctx.ui.notify("Agent execution changed. Reopen it to stop the current run.", "info");
+            return;
+          }
+          const accepted = manager.abort(record.id);
+          ctx.ui.notify(accepted
+            ? `${manager.isRunPending(record) ? "Stop requested for" : "Stopped"} "${record.description}".`
+            : `Agent "${record.description}" is no longer queued or running.`, "info");
+          widget.update();
+          fleet.update();
+        }
+        return;
+      }
+      ctx.ui.notify("Agent is expired — no session available.", "info");
       return;
     }
 
@@ -4334,6 +4457,9 @@ Write the file using the write tool. Only write the file, nothing else.`;
   }
 
   function notifyApplied(ctx: ExtensionCommandContext, successMsg: string) {
+    // Compare effective manager settings at the next safe boundary. UI-only
+    // settings and edits to disk cannot fabricate an applied runtime change.
+    runtimeStatusDirty = true;
     const { message, level } = saveAndEmitChanged(
       snapshotSettings(),
       successMsg,
